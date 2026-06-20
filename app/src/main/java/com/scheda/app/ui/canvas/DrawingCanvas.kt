@@ -244,14 +244,15 @@ fun DrawingCanvas(
                                         drawRect(selColor, Offset(l, t), Size(r - l, b - t), style = Stroke(selStroke, cap = StrokeCap.Round, join = StrokeJoin.Round))
                                     } else {
                                         val cx = (l + r) / 2f; val cy = (t + b) / 2f
+                                        val hw = (r - l) / 2f; val hh = (b - t) / 2f
                                         val cosR = kotlin.math.cos(hl.rotation); val sinR = kotlin.math.sin(hl.rotation)
                                         fun rot(wx: Float, wy: Float): Offset {
                                             val dx = wx - cx; val dy = wy - cy
                                             return Offset(cx + dx * cosR - dy * sinR, cy + dx * sinR + dy * cosR)
                                         }
                                         val path = Path().apply {
-                                            val c0 = rot(l, t); val c1 = rot(r, t)
-                                            val c2 = rot(r, b); val c3 = rot(l, b)
+                                            val c0 = rot(cx - hw, cy - hh); val c1 = rot(cx + hw, cy - hh)
+                                            val c2 = rot(cx + hw, cy + hh); val c3 = rot(cx - hw, cy + hh)
                                             moveTo(c0.x, c0.y); lineTo(c1.x, c1.y)
                                             lineTo(c2.x, c2.y); lineTo(c3.x, c3.y); close()
                                         }
@@ -472,6 +473,9 @@ private fun DrawScope.drawRectanglePrimitive(
     val bottom = maxOf(p.startY, p.endY)
     val cx = (left + right) / 2f
     val cy = (top + bottom) / 2f
+    // 矩形实际半宽/半高（前旋转尺寸）
+    val hw = (right - left) / 2f
+    val hh = (bottom - top) / 2f
 
     val rectPath = Path().apply {
         if (kotlin.math.abs(p.rotation) < 0.001f) {
@@ -482,14 +486,15 @@ private fun DrawScope.drawRectanglePrimitive(
         } else {
             val cosR = kotlin.math.cos(p.rotation)
             val sinR = kotlin.math.sin(p.rotation)
-            fun rot(wx: Float, wy: Float): Offset {
+            // 用实际半宽/半高计算4个角，再旋转，而非旋转AABB角点
+            fun corner(wx: Float, wy: Float): Offset {
                 val dx = wx - cx; val dy = wy - cy
                 return Offset(cx + dx * cosR - dy * sinR, cy + dx * sinR + dy * cosR)
             }
-            val c0 = rot(left, top)
-            val c1 = rot(right, top)
-            val c2 = rot(right, bottom)
-            val c3 = rot(left, bottom)
+            val c0 = corner(cx - hw, cy - hh)
+            val c1 = corner(cx + hw, cy - hh)
+            val c2 = corner(cx + hw, cy + hh)
+            val c3 = corner(cx - hw, cy + hh)
             moveTo(c0.x, c0.y)
             lineTo(c1.x, c1.y)
             lineTo(c2.x, c2.y)
