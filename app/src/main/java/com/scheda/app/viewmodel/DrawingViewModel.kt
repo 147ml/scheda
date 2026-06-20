@@ -1,6 +1,8 @@
 package com.scheda.app.viewmodel
 
 import android.content.Context
+import android.graphics.Paint
+import android.graphics.Typeface
 import android.net.Uri
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -476,22 +478,46 @@ class DrawingViewModel(
             floatArrayOf(xs.min() - pad, ys.min() - pad, xs.max() + pad, ys.max() + pad)
         }
         is DrawingPrimitive.NumberLabelPrimitive -> {
-            val numChars = p.value.toString().length.coerceAtLeast(1)
-            val hw = p.fontSize * 0.3f * numChars; val hh = p.fontSize * 0.4f
+            val paint = Paint().apply {
+                textSize = p.fontSize * 1.3f * globalLineScale * p.lineScaleFactor
+                typeface = Typeface.DEFAULT_BOLD
+                isAntiAlias = true
+                textAlign = Paint.Align.CENTER
+            }
+            val textWidth = paint.measureText(p.value.toString())
+            val fm = paint.fontMetrics
+            val hw = textWidth / 2f
+            val hh = (fm.descent - fm.ascent) / 2f
             floatArrayOf(p.x - hw, p.y - hh, p.x + hw, p.y + hh)
         }
         is DrawingPrimitive.TextPrimitive -> {
-            val numChars = p.text.length.coerceAtLeast(1)
-            val hw = p.fontSize * 0.35f * numChars; val hh = p.fontSize * 0.5f
+            val paint = Paint().apply {
+                textSize = p.fontSize * 1.3f * globalLineScale * p.lineScaleFactor
+                typeface = Typeface.DEFAULT_BOLD
+                isAntiAlias = true
+                textAlign = Paint.Align.CENTER
+            }
+            val textWidth = paint.measureText(p.text)
+            val fm = paint.fontMetrics
+            val hw = textWidth / 2f
+            val hh = (fm.descent - fm.ascent) / 2f
             floatArrayOf(p.x - hw, p.y - hh, p.x + hw, p.y + hh)
         }
         is DrawingPrimitive.RangeLabelPrimitive -> {
             val arrowLen = maxOf(80f * p.arrowSpan, 20f)
-            val maxDigits = maxOf(p.startValue.toString().length, p.endValue.toString().length).coerceAtLeast(1)
-            val numWidth = p.fontSize * 0.35f * maxDigits
-            val gap = p.fontSize * 1.0f
-            val halfW = numWidth + arrowLen / 2f + gap
-            val halfH = p.fontSize * 0.6f
+            val paint = Paint().apply {
+                textSize = p.fontSize * 1.3f * globalLineScale * p.lineScaleFactor
+                typeface = Typeface.DEFAULT_BOLD
+                isAntiAlias = true
+                textAlign = Paint.Align.CENTER
+            }
+            val w1 = paint.measureText(p.startValue.toString())
+            val w2 = paint.measureText(p.endValue.toString())
+            val gap = p.fontSize
+            val totalW = w1 + w2 + arrowLen + gap * 2f
+            val halfW = totalW / 2f
+            val fm = paint.fontMetrics
+            val halfH = (fm.descent - fm.ascent) / 2f
             if (kotlin.math.abs(p.rotation) > 0.001f && !p.horizontalOnly) {
                 // Vertical mode: swap width and height
                 floatArrayOf(p.x - halfH, p.y - halfW, p.x + halfH, p.y + halfW)
@@ -715,9 +741,28 @@ class DrawingViewModel(
 
     fun updatePendingScale(sx: Float, sy: Float) {
         val pe = _pendingEdit.value
+        var newScaleX = (pe.scaleX * sx).coerceIn(0.1f, 10f)
+        var newScaleY = (pe.scaleY * sy).coerceIn(0.1f, 10f)
+        val p = pe.primitive
+        if (p is DrawingPrimitive.TextPrimitive || p is DrawingPrimitive.NumberLabelPrimitive) {
+            val baseFontSize = when (p) {
+                is DrawingPrimitive.TextPrimitive -> p.fontSize
+                is DrawingPrimitive.NumberLabelPrimitive -> p.fontSize
+                else -> 1f
+            }
+            if (baseFontSize > 0f) {
+                val maxAvgScale = (600f / baseFontSize).coerceAtMost(10f)
+                val avgScale = sqrt(abs(newScaleX * newScaleY))
+                if (avgScale > maxAvgScale) {
+                    val ratio = maxAvgScale / avgScale
+                    newScaleX = (newScaleX * ratio).coerceIn(0.1f, 10f)
+                    newScaleY = (newScaleY * ratio).coerceIn(0.1f, 10f)
+                }
+            }
+        }
         _pendingEdit.value = pe.copy(
-            scaleX = (pe.scaleX * sx).coerceIn(0.1f, 10f),
-            scaleY = (pe.scaleY * sy).coerceIn(0.1f, 10f)
+            scaleX = newScaleX,
+            scaleY = newScaleY
         )
     }
 
@@ -768,11 +813,11 @@ class DrawingViewModel(
         }
         val avgScale = sqrt(abs(pe.scaleX * pe.scaleY))
         return when (p) {
-            is DrawingPrimitive.TextPrimitive -> (p.fontSize * avgScale).coerceIn(30f, 400f)
-            is DrawingPrimitive.NumberLabelPrimitive -> (p.fontSize * avgScale).coerceIn(30f, 400f)
+            is DrawingPrimitive.TextPrimitive -> (p.fontSize * avgScale).coerceIn(30f, 600f)
+            is DrawingPrimitive.NumberLabelPrimitive -> (p.fontSize * avgScale).coerceIn(30f, 600f)
             is DrawingPrimitive.RangeLabelPrimitive -> {
                 val isUniform = abs(pe.scaleX - pe.scaleY) < 0.01f
-                (p.fontSize * (if (isUniform) avgScale else 1f)).coerceIn(20f, 400f)
+                (p.fontSize * (if (isUniform) avgScale else 1f)).coerceIn(20f, 600f)
             }
             else -> _lastTextFontSize
         }
@@ -871,14 +916,14 @@ class DrawingViewModel(
                 val t = transform(p.x, p.y)
                 val newRotation = (p.rotation + pe.rotation) % (2f * kotlin.math.PI.toFloat())
                 val avgScale = sqrt(abs(sx * sy))
-                val newFontSize = (p.fontSize * avgScale).coerceIn(30f, 400f)
+                val newFontSize = (p.fontSize * avgScale).coerceIn(30f, 600f)
                 p.copy(x = t.x, y = t.y, rotation = newRotation, fontSize = newFontSize)
             }
             is DrawingPrimitive.TextPrimitive -> {
                 val t = transform(p.x, p.y)
                 val newRotation = (p.rotation + pe.rotation) % (2f * kotlin.math.PI.toFloat())
                 val avgScale = sqrt(abs(sx * sy))
-                val newFontSize = (p.fontSize * avgScale).coerceIn(30f, 400f)
+                val newFontSize = (p.fontSize * avgScale).coerceIn(30f, 600f)
                 p.copy(x = t.x, y = t.y, rotation = newRotation, fontSize = newFontSize)
             }
             is DrawingPrimitive.RangeLabelPrimitive -> {
@@ -887,14 +932,15 @@ class DrawingViewModel(
                 // 箭头杆长：角手柄均匀缩放（sx≈sy）时同步放大 arrowSpan，中点手柄已由 updatePendingArrowSpan 直接修改
                 val avgScale = sqrt(abs(sx * sy))
                 val isUniform = abs(sx - sy) < 0.01f
-                val newFontSize = if (isUniform) (p.fontSize * avgScale).coerceIn(20f, 400f) else p.fontSize
-                val newArrowSpan = (p.arrowSpan * sx).coerceAtLeast(0.2f)
+                val newFontSize = if (isUniform) (p.fontSize * avgScale).coerceIn(20f, 600f) else p.fontSize
+                val newArrowSpan = ((p.arrowSpan / p.fontSize) * newFontSize).coerceAtLeast(0.2f)
                 p.copy(x = t.x, y = t.y, rotation = newRotation, fontSize = newFontSize, arrowSpan = newArrowSpan)
             }
             is DrawingPrimitive.BlockRefPrimitive -> {
                 val t = transform(p.x, p.y)
                 val avgScale = sqrt(abs(sx * sy))
-                p.copy(x = t.x, y = t.y, scale = (p.scale * avgScale).coerceIn(0.1f, 10f))
+                val newRotation = (p.rotation + pe.rotation) % (2f * kotlin.math.PI.toFloat())
+                p.copy(x = t.x, y = t.y, rotation = newRotation, scale = (p.scale * avgScale).coerceIn(0.1f, 10f))
             }
         }
     }
@@ -936,11 +982,36 @@ class DrawingViewModel(
                     fenceHitsGeometry(p, selBounds)
             }
         }.toSet()
+        val hideMp = allSelected.isNotEmpty() && allSelected.all { i ->
+            val p = _primitives.getOrNull(i)
+            p is DrawingPrimitive.TextPrimitive || p is DrawingPrimitive.NumberLabelPrimitive
+        }
         _selection.value = SelectionState(
             selectedIndices = allSelected,
             bounds = computeSelectionBounds(allSelected),
-            direction = if (lr) SelectDirection.INSIDE_TOUCH else SelectDirection.FULLY_COVER
+            rotation = computeSelectionRotation(allSelected),
+            direction = if (lr) SelectDirection.INSIDE_TOUCH else SelectDirection.FULLY_COVER,
+            hideMidpoints = hideMp
         )
+    }
+
+    /** Compute average rotation of selected primitives */
+    private fun computeSelectionRotation(indices: Set<Int>): Float {
+        if (indices.isEmpty()) return 0f
+        var sum = 0f; var count = 0
+        for (i in indices) {
+            val p = _primitives.getOrNull(i) ?: continue
+            val r = when (p) {
+                is DrawingPrimitive.RectanglePrimitive -> p.rotation
+                is DrawingPrimitive.NumberLabelPrimitive -> p.rotation
+                is DrawingPrimitive.TextPrimitive -> p.rotation
+                is DrawingPrimitive.RangeLabelPrimitive -> p.rotation
+                is DrawingPrimitive.BlockRefPrimitive -> p.rotation
+                else -> 0f
+            }
+            sum += r; count++
+        }
+        return if (count > 0) sum / count else 0f
     }
 
     fun computeSelectionBounds(indices: Set<Int>): Bounds? {
@@ -990,7 +1061,7 @@ class DrawingViewModel(
         if (indices.isEmpty()) return
         if (_selectionSnapshot == null) {
             _selectionSnapshot = indices.associateWith { _primitives[it] }
-            _selection.value = _selection.value.copy(rotation = 0f, initialBounds = _selection.value.bounds)
+            _selection.value = _selection.value.copy(initialBounds = _selection.value.bounds)
             _scaleAccumAvg = 1f
             pushUndo()
         }
@@ -1037,17 +1108,17 @@ class DrawingViewModel(
                 is DrawingPrimitive.NumberLabelPrimitive -> {
                     val t = tx(p.x, p.y)
                     val origFontSize = (snapshotP as? DrawingPrimitive.NumberLabelPrimitive)?.fontSize ?: p.fontSize
-                    p.copy(x = t.x, y = t.y, fontSize = (origFontSize * _scaleAccumAvg).coerceIn(30f, 400f))
+                    p.copy(x = t.x, y = t.y, fontSize = (origFontSize * _scaleAccumAvg).coerceIn(30f, 600f))
                 }
                 is DrawingPrimitive.TextPrimitive -> {
                     val t = tx(p.x, p.y)
                     val origFontSize = (snapshotP as? DrawingPrimitive.TextPrimitive)?.fontSize ?: p.fontSize
-                    p.copy(x = t.x, y = t.y, fontSize = (origFontSize * _scaleAccumAvg).coerceIn(30f, 400f))
+                    p.copy(x = t.x, y = t.y, fontSize = (origFontSize * _scaleAccumAvg).coerceIn(30f, 600f))
                 }
                 is DrawingPrimitive.RangeLabelPrimitive -> {
                     val t = tx(p.x, p.y)
                     val origFontSize = (snapshotP as? DrawingPrimitive.RangeLabelPrimitive)?.fontSize ?: p.fontSize
-                    p.copy(x = t.x, y = t.y, fontSize = (origFontSize * _scaleAccumAvg).coerceIn(20f, 400f))
+                    p.copy(x = t.x, y = t.y, fontSize = (origFontSize * _scaleAccumAvg).coerceIn(20f, 600f))
                 }
                 is DrawingPrimitive.BlockRefPrimitive -> {
                     val t = tx(p.x, p.y)
@@ -1063,7 +1134,7 @@ class DrawingViewModel(
         if (indices.isEmpty()) return
         if (_selectionSnapshot == null) {
             _selectionSnapshot = indices.associateWith { _primitives[it] }
-            _selection.value = _selection.value.copy(rotation = 0f, initialBounds = _selection.value.bounds)
+            _selection.value = _selection.value.copy(initialBounds = _selection.value.bounds)
             pushUndo()
         }
         val selBounds = _selection.value.initialBounds ?: _selection.value.bounds ?: return
@@ -1078,15 +1149,18 @@ class DrawingViewModel(
             _primitives[i] = when (p) {
                 is DrawingPrimitive.FreehandPath -> p.copy(points = p.points.map { rot(it.x, it.y) })
                 is DrawingPrimitive.RectanglePrimitive -> {
+                    val rcX = minOf(p.startX, p.endX) + abs(p.endX - p.startX) / 2f
+                    val rcY = minOf(p.startY, p.endY) + abs(p.endY - p.startY) / 2f
                     val hw = abs(p.endX - p.startX) / 2f
                     val hh = abs(p.endY - p.startY) / 2f
                     val cosP = kotlin.math.cos(p.rotation)
                     val sinP = kotlin.math.sin(p.rotation)
+                    // Visual corners centered on rectangle's own center, then rotated around selection center
                     val visCorners = listOf(
-                        cx + (-hw) * cosP - (-hh) * sinP to cy + (-hw) * sinP + (-hh) * cosP,
-                        cx + ( hw) * cosP - (-hh) * sinP to cy + ( hw) * sinP + (-hh) * cosP,
-                        cx + ( hw) * cosP - ( hh) * sinP to cy + ( hw) * sinP + ( hh) * cosP,
-                        cx + (-hw) * cosP - ( hh) * sinP to cy + (-hw) * sinP + ( hh) * cosP,
+                        rcX + (-hw) * cosP - (-hh) * sinP to rcY + (-hw) * sinP + (-hh) * cosP,
+                        rcX + ( hw) * cosP - (-hh) * sinP to rcY + ( hw) * sinP + (-hh) * cosP,
+                        rcX + ( hw) * cosP - ( hh) * sinP to rcY + ( hw) * sinP + ( hh) * cosP,
+                        rcX + (-hw) * cosP - ( hh) * sinP to rcY + (-hw) * sinP + ( hh) * cosP,
                     )
                     val cosR = kotlin.math.cos(rotation); val sinR = kotlin.math.sin(rotation)
                     val transCorners = visCorners.map { (wx, wy) ->
@@ -1106,11 +1180,11 @@ class DrawingViewModel(
                 is DrawingPrimitive.NumberLabelPrimitive -> { val t = rot(p.x, p.y); p.copy(x = t.x, y = t.y, rotation = p.rotation + rotation) }
                 is DrawingPrimitive.TextPrimitive -> { val t = rot(p.x, p.y); p.copy(x = t.x, y = t.y, rotation = p.rotation + rotation) }
                 is DrawingPrimitive.RangeLabelPrimitive -> { val t = rot(p.x, p.y); p.copy(x = t.x, y = t.y, rotation = p.rotation + rotation) }
-                is DrawingPrimitive.BlockRefPrimitive -> { val t = rot(p.x, p.y); p.copy(x = t.x, y = t.y) }
+                is DrawingPrimitive.BlockRefPrimitive -> { val t = rot(p.x, p.y); p.copy(x = t.x, y = t.y, rotation = p.rotation + rotation) }
             }
         }
         val curR = _selection.value.rotation
-        _selection.value = _selection.value.copy(rotation = curR + rotation, bounds = computeSelectionBounds(_selection.value.selectedIndices))
+        _selection.value = _selection.value.copy(rotation = curR + rotation)
     }
 
     fun confirmSelectionTransform() {
@@ -1127,8 +1201,7 @@ class DrawingViewModel(
     fun finalizeSelectionTransform() {
         _selectionSnapshot = null; _scaleAccumAvg = 1f
         val s = _selection.value
-        _selection.value = s.copy(rotation = 0f, initialBounds = null,
-            bounds = computeSelectionBounds(s.selectedIndices))
+        _selection.value = s.copy(initialBounds = null)
         autoSave()
     }
 
@@ -1304,7 +1377,7 @@ class DrawingViewModel(
     fun updateSelectedFontSize(fontSize: Float) {
         val indices = _selection.value.selectedIndices; if (indices.isEmpty()) return
         pushUndo()
-        val clamped = fontSize.coerceIn(30f, 400f)
+        val clamped = fontSize.coerceIn(30f, 600f)
         for (i in indices.sortedDescending()) {
             when (val p = _primitives[i]) {
                 is DrawingPrimitive.NumberLabelPrimitive -> _primitives[i] = p.copy(fontSize = clamped)

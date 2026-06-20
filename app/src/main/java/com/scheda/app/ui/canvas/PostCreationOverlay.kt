@@ -1,6 +1,7 @@
 package com.scheda.app.ui.canvas
 
 import android.graphics.Paint
+import android.graphics.Typeface
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
@@ -98,8 +99,40 @@ fun PostCreationOverlay(
     val cy = (bounds.minY + bounds.maxY) / 2f + pendingEdit.offsetY
     // Minimum half-extent in screen pixels (so corner handles don't collapse)
     val minHalf = with(density) { 30.dp.toPx() }
-    val halfW = maxOf(((bounds.maxX - bounds.minX) / 2f) * pendingEdit.scaleX, minHalf / canvasScale)
-    val halfH = maxOf(((bounds.maxY - bounds.minY) / 2f) * pendingEdit.scaleY, minHalf / canvasScale)
+    val textMeasurePaint = Paint().apply {
+        typeface = Typeface.DEFAULT_BOLD
+        isAntiAlias = true
+        textAlign = Paint.Align.CENTER
+    }
+    val (halfW, halfH) = when (val p = pendingEdit.primitive) {
+        is DrawingPrimitive.TextPrimitive -> {
+            val avgScale = sqrt(abs(pendingEdit.scaleX * pendingEdit.scaleY))
+            val lineScale = globalLineScale * p.lineScaleFactor
+            textMeasurePaint.textSize = p.fontSize * avgScale * lineScale * 1.3f
+            val textWidth = textMeasurePaint.measureText(p.text)
+            val fm = textMeasurePaint.fontMetrics
+            Pair(
+                maxOf(textWidth / 2f, minHalf / canvasScale),
+                maxOf((fm.descent - fm.ascent) / 2f, minHalf / canvasScale)
+            )
+        }
+        is DrawingPrimitive.NumberLabelPrimitive -> {
+            val avgScale = sqrt(abs(pendingEdit.scaleX * pendingEdit.scaleY))
+            val lineScale = globalLineScale * p.lineScaleFactor
+            textMeasurePaint.textSize = p.fontSize * avgScale * lineScale * 1.3f
+            val textWidth = textMeasurePaint.measureText(p.value.toString())
+            val fm = textMeasurePaint.fontMetrics
+            Pair(
+                maxOf(textWidth / 2f, minHalf / canvasScale),
+                maxOf((fm.descent - fm.ascent) / 2f, minHalf / canvasScale)
+            )
+        }
+        else -> {
+            val w = maxOf(((bounds.maxX - bounds.minX) / 2f) * pendingEdit.scaleX, minHalf / canvasScale)
+            val h = maxOf(((bounds.maxY - bounds.minY) / 2f) * pendingEdit.scaleY, minHalf / canvasScale)
+            Pair(w, h)
+        }
+    }
     // Frame rotation = pending edit handle rotation + primitive's intrinsic rotation
     val primFrameRot = when (val p = pendingEdit.primitive) {
         is DrawingPrimitive.RangeLabelPrimitive -> p.rotation
@@ -579,14 +612,15 @@ private fun DrawScope.drawPrimitiveAt(
             val totalRotation = edit.rotation + primitive.rotation
             val avgScale = sqrt(abs(edit.scaleX * edit.scaleY))
             val lineScale = strokeScale
-            val fs = primitive.fontSize * avgScale * lineScale * canvasScale * 1.3f
+            val effectiveFontSize = (primitive.fontSize * avgScale).coerceIn(30f, 600f)
+            val fs = effectiveFontSize * lineScale * canvasScale * 1.3f
             val p = Paint().apply {
                 color = primitive.color.copy(alpha = alpha).hashCode()
                 textSize = fs
                 isAntiAlias = true; textAlign = Paint.Align.CENTER
             }
             val nc = drawContext.canvas.nativeCanvas
-            if (kotlin.math.abs(totalRotation) > 0.001f && !primitive.horizontalOnly) {
+            if (kotlin.math.abs(totalRotation) > 0.001f) {
                 nc.save()
                 nc.rotate(totalRotation * 180f / kotlin.math.PI.toFloat(), pt.x, pt.y)
                 nc.drawText(text, pt.x, pt.y + fs * 0.3f, p)
@@ -600,7 +634,8 @@ private fun DrawScope.drawPrimitiveAt(
             val totalRotation = edit.rotation + primitive.rotation
             val avgScale = sqrt(abs(edit.scaleX * edit.scaleY))
             val lineScale = strokeScale
-            val fs = primitive.fontSize * avgScale * lineScale * canvasScale
+            val effectiveFontSize = (primitive.fontSize * avgScale).coerceIn(30f, 600f)
+            val fs = effectiveFontSize * lineScale * canvasScale
             val p = Paint().apply {
                 color = primitive.color.copy(alpha = alpha).hashCode()
                 textSize = fs * 1.3f
@@ -609,7 +644,7 @@ private fun DrawScope.drawPrimitiveAt(
             val nc = drawContext.canvas.nativeCanvas
             val text = primitive.text
             if (text.isBlank()) return@drawPrimitiveAt
-            if (kotlin.math.abs(totalRotation) > 0.001f && !primitive.horizontalOnly) {
+            if (kotlin.math.abs(totalRotation) > 0.001f) {
                 nc.save()
                 nc.rotate(totalRotation * 180f / kotlin.math.PI.toFloat(), pt.x, pt.y)
                 nc.drawText(text, pt.x, pt.y + fs * 0.3f, p)
@@ -623,7 +658,9 @@ private fun DrawScope.drawPrimitiveAt(
             val avgScale = sqrt(abs(edit.scaleX * edit.scaleY))
             val isUniform = abs(edit.scaleX - edit.scaleY) < 0.01f
             val lineScale = strokeScale
-            val fs = primitive.fontSize * (if (isUniform) avgScale else 1f) * lineScale * canvasScale
+            // 字号上限与 applyTransform 一致，确保预览和确认后一致
+            val effectiveFontSize = if (isUniform) (primitive.fontSize * avgScale).coerceIn(20f, 600f) else primitive.fontSize
+            val fs = effectiveFontSize * lineScale * canvasScale
             val totalRotation = edit.rotation + primitive.rotation
             val p = Paint().apply {
                 color = primitive.color.copy(alpha = alpha).hashCode()
@@ -634,7 +671,9 @@ private fun DrawScope.drawPrimitiveAt(
             val label1 = primitive.startValue.toString()
             val label2 = primitive.endValue.toString()
             val gap = fs * 1.0f
-            val arrowLen = maxOf((edit.scaleX * 80f * primitive.arrowSpan * lineScale * canvasScale), 20f)
+            // 箭头杆长与字号保持比例（与 applyTransform 一致）
+            val effectiveArrowSpan = primitive.arrowSpan * (effectiveFontSize / primitive.fontSize)
+            val arrowLen = maxOf((effectiveArrowSpan * 80f * lineScale * canvasScale), 20f)
 
             if (kotlin.math.abs(totalRotation) < 0.001f) {
                 drawPreviewLabelContent(nc, p, label1, label2, pt.x, pt.y, fs, arrowLen, gap, primitive, alpha, canvasScale, lineScale)
