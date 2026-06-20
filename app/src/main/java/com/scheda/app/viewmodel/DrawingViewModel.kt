@@ -454,12 +454,14 @@ class DrawingViewModel(
                 floatArrayOf(left, top, right, bottom)
             } else {
                 val cx = (left + right) / 2f; val cy = (top + bottom) / 2f
+                val hw = (right - left) / 2f; val hh = (bottom - top) / 2f
                 val cosR = kotlin.math.cos(p.rotation); val sinR = kotlin.math.sin(p.rotation)
                 fun rot(wx: Float, wy: Float): Point2D {
                     val dx = wx - cx; val dy = wy - cy
                     return Point2D(cx + dx * cosR - dy * sinR, cy + dx * sinR + dy * cosR)
                 }
-                val pts = listOf(rot(left, top), rot(right, top), rot(right, bottom), rot(left, bottom))
+                val pts = listOf(rot(cx - hw, cy - hh), rot(cx + hw, cy - hh),
+                    rot(cx + hw, cy + hh), rot(cx - hw, cy + hh))
                 val xs = pts.map { it.x }; val ys = pts.map { it.y }
                 floatArrayOf(xs.min(), ys.min(), xs.max(), ys.max())
             }
@@ -824,42 +826,31 @@ class DrawingViewModel(
             is DrawingPrimitive.RectanglePrimitive -> {
                 if (dx == 0f && dy == 0f && pe.rotation == 0f && sx == 1f && sy == 1f) return p
                 val newRotation = (p.rotation + pe.rotation) % (2f * kotlin.math.PI.toFloat())
-                if (sx == 1f && sy == 1f) {
-                    // 纯旋转+平移：保持 RectanglePrimitive，只更新位置和旋转
-                    return p.copy(
-                        startX = p.startX + dx, startY = p.startY + dy,
-                        endX = p.endX + dx, endY = p.endY + dy,
-                        rotation = newRotation
-                    )
-                }
-                if (kotlin.math.abs(pe.rotation) < 0.01f) {
-                    // 纯缩放+平移（无旋转）：保持 RectanglePrimitive，缩放包围盒
-                    val cw = abs(p.endX - p.startX)
-                    val ch = abs(p.endY - p.startY)
-                    val newCx = cx0 + dx; val newCy = cy0 + dy
-                    val newW = cw * sx; val newH = ch * sy
-                    return p.copy(
-                        startX = newCx - newW / 2f, startY = newCy - newH / 2f,
-                        endX = newCx + newW / 2f, endY = newCy + newH / 2f,
-                        rotation = newRotation
-                    )
-                }
-                // 缩放+旋转：沿四边密集采样转 FreehandPath（每边 8 点，避免样条变圆角）
-                val segs = 8
-                val pts = mutableListOf<Point2D>()
-                val corners = listOf(
-                    Point2D(p.startX, p.startY), Point2D(p.endX, p.startY),
-                    Point2D(p.endX, p.endY), Point2D(p.startX, p.endY)
+                // 原始矩形半宽半高和中心
+                val hw0 = abs(p.endX - p.startX) / 2f
+                val hh0 = abs(p.endY - p.startY) / 2f
+                val rectCx = (p.startX + p.endX) / 2f
+                val rectCy = (p.startY + p.endY) / 2f
+                val cosR0 = cos(p.rotation.toDouble()).toFloat()
+                val sinR0 = sin(p.rotation.toDouble()).toFloat()
+                // 原始4个角（含 p.rotation）
+                fun rc(dx: Float, dy: Float) = Point2D(rectCx + dx * cosR0 - dy * sinR0,
+                    rectCy + dx * sinR0 + dy * cosR0)
+                val corners = listOf(rc(-hw0, -hh0), rc(hw0, -hh0), rc(hw0, hh0), rc(-hw0, hh0))
+                // 应用 PendingEdit 变换
+                val t = corners.map { transform(it.x, it.y) }
+                // 从边长计算实际宽高（变换后的矩形，非 AABB）
+                val w = sqrt(((t[1].x - t[0].x) * (t[1].x - t[0].x) +
+                    (t[1].y - t[0].y) * (t[1].y - t[0].y)).toDouble()).toFloat()
+                val h = sqrt(((t[2].x - t[1].x) * (t[2].x - t[1].x) +
+                    (t[2].y - t[1].y) * (t[2].y - t[1].y)).toDouble()).toFloat()
+                val newCx = (t.sumOf { it.x.toDouble() } / 4f).toFloat()
+                val newCy = (t.sumOf { it.y.toDouble() } / 4f).toFloat()
+                return p.copy(
+                    startX = newCx - w / 2f, startY = newCy - h / 2f,
+                    endX = newCx + w / 2f, endY = newCy + h / 2f,
+                    rotation = newRotation
                 )
-                for (i in 0 until 4) {
-                    val a = corners[i]; val b = corners[(i + 1) % 4]
-                    for (j in 0 until segs) {
-                        val t = j.toFloat() / segs
-                        pts.add(transform(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y)))
-                    }
-                }
-                DrawingPrimitive.FreehandPath(points = pts, isClosed = true, color = p.color,
-                    strokeWidth = p.strokeWidth, layerId = p.layerId, lineStyle = p.lineStyle)
             }
             is DrawingPrimitive.CirclePrimitive -> {
                 if (dx == 0f && dy == 0f && pe.rotation == 0f && sx == 1f && sy == 1f) return p
@@ -1014,10 +1005,25 @@ class DrawingViewModel(
                 is DrawingPrimitive.FreehandPath -> p.copy(points = p.points.map { tx(it.x, it.y) })
                 is DrawingPrimitive.RectanglePrimitive -> {
                     if (sx != 1f || sy != 1f) {
-                        val pts = listOf(tx(p.startX, p.startY), tx(p.endX, p.startY),
-                            tx(p.endX, p.endY), tx(p.startX, p.endY))
-                        DrawingPrimitive.FreehandPath(points = pts, isClosed = true, color = p.color,
-                            strokeWidth = p.strokeWidth, layerId = p.layerId, lineStyle = p.lineStyle)
+                        val hw = abs(p.endX - p.startX) / 2f
+                        val hh = abs(p.endY - p.startY) / 2f
+                        val rcx = (p.startX + p.endX) / 2f
+                        val rcy = (p.startY + p.endY) / 2f
+                        val cosP = kotlin.math.cos(p.rotation)
+                        val sinP = kotlin.math.sin(p.rotation)
+                        fun rc(dx: Float, dy: Float) = Point2D(rcx + dx * cosP - dy * sinP,
+                            rcy + dx * sinP + dy * cosP)
+                        val corners = listOf(rc(-hw, -hh), rc(hw, -hh), rc(hw, hh), rc(-hw, hh))
+                        val sc = corners.map { tx(it.x, it.y) }
+                        // 从边长计算实际宽高
+                        val nw = sqrt(((sc[1].x - sc[0].x) * (sc[1].x - sc[0].x) +
+                            (sc[1].y - sc[0].y) * (sc[1].y - sc[0].y)).toDouble()).toFloat()
+                        val nh = sqrt(((sc[2].x - sc[1].x) * (sc[2].x - sc[1].x) +
+                            (sc[2].y - sc[1].y) * (sc[2].y - sc[1].y)).toDouble()).toFloat()
+                        val ncx = (sc.sumOf { it.x.toDouble() } / 4f).toFloat()
+                        val ncy = (sc.sumOf { it.y.toDouble() } / 4f).toFloat()
+                        p.copy(startX = ncx - nw / 2f, startY = ncy - nh / 2f,
+                            endX = ncx + nw / 2f, endY = ncy + nh / 2f, rotation = p.rotation)
                     } else p
                 }
                 is DrawingPrimitive.CirclePrimitive -> {
