@@ -1,0 +1,5 @@
+# docs/verify_dxf_export.py 本地模拟验证所需的宿主 Python 依赖
+# 用途：在开发机（非 Android）上跑 DXF 导出逻辑验证脚本 docs/verify_dxf_export.py
+#       （ezdxf audit + TEXT 旋转/对齐 + IMAGE 三件套检查）。
+# 注意：App 运行时同款 ezdxf 已由 app/build.gradle.kts 的 chaquopy.pip 安装，无需手动装。
+ezdxf==1.4.4
