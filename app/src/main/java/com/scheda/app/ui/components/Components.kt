@@ -11,6 +11,11 @@ import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.graphicsLayer
 import kotlin.math.roundToInt
 import androidx.compose.foundation.Canvas
@@ -33,6 +38,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -51,14 +57,19 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import kotlinx.coroutines.delay
 import androidx.compose.foundation.layout.RowScope
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import com.scheda.app.ui.components.GlassOverlayEffect
 import com.scheda.app.file.RecoveryManager
 import com.scheda.app.file.SchedaSerializer
 import com.scheda.app.file.ShareUtil
@@ -67,6 +78,7 @@ import com.scheda.app.model.DrawingPrimitive
 import com.scheda.app.model.Layer
 import com.scheda.app.model.LineStyle
 import com.scheda.app.model.LineType
+import com.scheda.app.file.RecycleBinManager
 import com.scheda.app.model.ToolType
 import com.scheda.app.viewmodel.DrawingViewModel
 import com.scheda.app.viewmodel.HomeViewModel
@@ -78,11 +90,12 @@ import com.scheda.app.viewmodel.HomeViewModel
 class HomeViewModelFactory(
     private val storageManager: StorageManager,
     private val shareUtil: ShareUtil,
-    private val serializer: SchedaSerializer
+    private val serializer: SchedaSerializer,
+    private val recycleBin: RecycleBinManager
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T =
-        HomeViewModel(storageManager, shareUtil, serializer) as T
+        HomeViewModel(storageManager, shareUtil, serializer, recycleBin) as T
 }
 
 class DrawingViewModelFactory(
@@ -92,7 +105,7 @@ class DrawingViewModelFactory(
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T =
-        DrawingViewModel(storageManager, serializer, recoveryManager, storageManager.context) as T
+        DrawingViewModel(storageManager, serializer, recoveryManager, storageManager.context.applicationContext) as T
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -105,13 +118,25 @@ fun BottomToolbar(
     viewModel: DrawingViewModel,
     onShowNumberDialog: () -> Unit,
     onShowTextDialog: () -> Unit = {},
-    onShowRangeDialog: () -> Unit = {}
+    onShowRangeDialog: () -> Unit = {},
+    onShowNumArrayDialog: () -> Unit = {},
+    backdrop: com.kyant.backdrop.Backdrop? = null,
+    modifier: Modifier = Modifier,
 ) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shadowElevation = 4.dp,
-        color = Color(0xFF2A2A2A)
+    val glass = backdrop != null
+    val fg: (Color) -> Color = { c -> glassAdapt(c, glass) }
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .glassSurface(
+                backdrop = backdrop,
+                shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
+                fallback = Color(0xFF2A2A2A),
+            )
     ) {
+        // 虚线间距弹窗（点“比例”文字弹出，位置贴着文字上方）
+        var dashPopup by remember { mutableStateOf(false) }
+        var dashAnchor by remember { mutableStateOf<Rect?>(null) }
         Column(modifier = Modifier.navigationBarsPadding().padding(horizontal = 6.dp, vertical = 2.dp)) {
             // ── Row 2 ──
             Row(
@@ -123,10 +148,10 @@ fun BottomToolbar(
                 val ctLineType = viewModel.currentLineStyle.type
                 val ctLabel = when (ctLineType) { LineType.DASHED -> "虚线"; LineType.LIGHTNING -> "闪电"; else -> "实线" }
                 Box {
-                    DarkPill(onClick = { ltExpanded = true }, modifier = Modifier.widthIn(min = 40.dp)) {
-                        Text(ctLabel, fontSize = 11.sp, maxLines = 1, color = Color.White, fontWeight = FontWeight.Bold)
+                    DarkPill(onClick = { ltExpanded = true }, modifier = Modifier.width(56.dp), glass = glass) {
+                        Text(ctLabel, fontSize = 11.sp, maxLines = 1, color = fg(Color.White), fontWeight = FontWeight.Bold)
                         Spacer(Modifier.width(2.dp))
-                        Text("▲", fontSize = 6.sp, color = Color(0xFFAAAAAA))
+                        Text("▲", fontSize = 6.sp, color = fg(Color(0xFFAAAAAA)))
                     }
                     DarkDropdownMenu(
                         expanded = ltExpanded,
@@ -143,14 +168,14 @@ fun BottomToolbar(
                                 onClick = { viewModel.setLineStyle(LineStyle(type = lt)); ltExpanded = false }
                             )
                             if (index < 2) {
-                                HorizontalDivider(thickness = 0.5.dp, color = Color(0xFF3A3A3A))
+                                HorizontalDivider(thickness = 0.5.dp, color = if (glass) Color(0x22000000) else Color(0xFF3A3A3A))
                             }
                         }
                     }
                 }
                 Spacer(Modifier.width(4.dp))
                 // 线型预览 — 与实际绘制效果一致
-                val prevColor = Color(0xFFCCCCCC)
+                val prevColor = fg(Color(0xFFCCCCCC))
                 val ls = viewModel.currentLineStyle
                 val sw = viewModel.strokeWidth
                 val pxScale = LocalDensity.current.density
@@ -186,35 +211,45 @@ fun BottomToolbar(
                 }
                 Spacer(Modifier.width(4.dp))
                 // 线宽
-                Text("线宽", fontSize = 10.sp, color = Color(0xFFCCCCCC))
-                Spacer(Modifier.width(2.dp))
+                Text("线宽", fontSize = 10.sp, color = fg(Color(0xFFCCCCCC)))
+                Spacer(Modifier.width(6.dp))
                 CompactSlider(
-                    value = viewModel.strokeWidth,
+                    value = viewModel.toolbarStrokeWidth,
                     onValueChange = { viewModel.setStrokeWidth(it) },
                     valueRange = 1f..20f,
                     modifier = Modifier.width(76.dp).height(20.dp),
                     thumbSize = 8.dp
                 )
-                Text("${viewModel.strokeWidth.toInt()}", fontSize = 10.sp, color = Color(0xFFCCCCCC), modifier = Modifier.width(14.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("${viewModel.toolbarStrokeWidth.toInt()}", fontSize = 10.sp, color = fg(Color(0xFFCCCCCC)), modifier = Modifier.width(14.dp))
                 Spacer(Modifier.width(4.dp))
-                // 全局线型比例
-                Text("比例", fontSize = 10.sp, color = Color(0xFFCCCCCC))
-                Spacer(Modifier.width(2.dp))
+                // 线型比例：无选中=全局；有选中=作用于选中元素（多值不一显示"多"、起点取最大值、调节统一设值）
+                val selScales = viewModel.selection.selectedIndices.mapNotNull { viewModel.primitives.getOrNull(it)?.lineScaleFactor }
+                val scaleValue = selScales.maxOrNull() ?: viewModel.globalLineScale
+                Text("比例", fontSize = 10.sp, color = fg(Color(0xFFCCCCCC)),
+                    modifier = Modifier
+                        .onGloballyPositioned { dashAnchor = it.boundsInWindow() }
+                        .clickable { dashPopup = true })
+                Spacer(Modifier.width(6.dp))
                 CompactSlider(
-                    value = viewModel.globalLineScale,
-                    onValueChange = { viewModel.setGlobalLineScale(it) },
+                    value = scaleValue,
+                    onValueChange = { v ->
+                        if (selScales.isEmpty()) viewModel.setGlobalLineScale(v)
+                        else viewModel.updateSelectedLineScale(v)
+                    },
                     valueRange = 0.25f..4f,
                     modifier = Modifier.width(76.dp).height(20.dp),
                     thumbSize = 8.dp
                 )
-                Text("${"%.1f".format(viewModel.globalLineScale)}", fontSize = 10.sp, color = Color(0xFFCCCCCC), modifier = Modifier.width(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("%.1f".format(scaleValue), fontSize = 10.sp, color = fg(Color(0xFFCCCCCC)), modifier = Modifier.width(18.dp))
                 Spacer(Modifier.width(4.dp))
                 // 颜色圆 — 点击弹出颜色选择
                 var colorDlg by remember { mutableStateOf(false) }
-                Box(Modifier.size(24.dp).clip(CircleShape).background(viewModel.currentColor)
-                    .border(1.5f.dp, Color(0xFFCCCCCC), CircleShape)
+                Box(Modifier.size(24.dp).clip(CircleShape).background(viewModel.toolbarColor)
+                    .border(1.5f.dp, fg(Color(0xFFCCCCCC)), CircleShape)
                     .clickable { colorDlg = true })
-                if (colorDlg) ColorPickerDialog(viewModel.currentColor, { viewModel.setColor(it) }, { colorDlg = false })
+                if (colorDlg) ColorPickerDialog(viewModel.toolbarColor, { viewModel.setColor(it) }, { colorDlg = false })
             }
 
 // ── Row 3 (bottom): 工具 ─────────────────────────
@@ -226,20 +261,21 @@ fun BottomToolbar(
                 // 文字+数字合并为弹出菜单（套 Box 里，避免 DropdownMenu 参与 Row 测量）
                 Box(Modifier.weight(1f)) {
                     var textNumExpanded by remember { mutableStateOf(false) }
-                    val isTextNum = viewModel.currentTool == ToolType.ANNOTATE || viewModel.currentTool == ToolType.TEXT || viewModel.currentTool == ToolType.RANGE
+                    val isTextNum = viewModel.currentTool == ToolType.ANNOTATE || viewModel.currentTool == ToolType.TEXT || viewModel.currentTool == ToolType.RANGE || viewModel.currentTool == ToolType.NUM_ARRAY
                     val label = when (viewModel.currentTool) {
                         ToolType.ANNOTATE -> "数字"
                         ToolType.TEXT -> "文字"
                         ToolType.RANGE -> "区间"
+                        ToolType.NUM_ARRAY -> "数阵"
                         else -> "文字"
                     }
                     DarkPill(onClick = { textNumExpanded = true },
-                        modifier = Modifier.fillMaxWidth()) {
+                        modifier = Modifier.fillMaxWidth(), glass = glass, selected = isTextNum) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(label, fontSize = 11.sp, maxLines = 1,
-                                color = if (isTextNum) Color.White else Color(0xFFAAAAAA))
+                                color = if (isTextNum) fg(Color.White) else fg(Color(0xFFAAAAAA)))
                             Spacer(Modifier.width(2.dp))
-                            Text("▲", fontSize = 6.sp, color = Color(0xFF999999))
+                            Text("▲", fontSize = 6.sp, color = fg(Color(0xFF999999)))
                         }
                     }
                     DarkDropdownMenu(
@@ -249,15 +285,16 @@ fun BottomToolbar(
                         listOf(
                             Triple("文字", ToolType.TEXT, onShowTextDialog),
                             Triple("数字", ToolType.ANNOTATE, onShowNumberDialog),
-                            Triple("区间数字", ToolType.RANGE, onShowRangeDialog)
+                            Triple("区间数字", ToolType.RANGE, onShowRangeDialog),
+                            Triple("数字阵列", ToolType.NUM_ARRAY, onShowNumArrayDialog)
                         ).forEachIndexed { index, (itemLabel, tool, action) ->
                             DarkMenuItem(
                                 label = itemLabel,
                                 selected = viewModel.currentTool == tool,
-                                onClick = { textNumExpanded = false; action() }
+                                onClick = { textNumExpanded = false; viewModel.setTool(tool); action() }
                             )
-                            if (index < 2) {
-                                HorizontalDivider(thickness = 0.5.dp, color = Color(0xFF3A3A3A))
+                            if (index < 3) {
+                                HorizontalDivider(thickness = 0.5.dp, color = if (glass) Color(0x22000000) else Color(0xFF3A3A3A))
                             }
                         }
                     }
@@ -272,9 +309,76 @@ fun BottomToolbar(
                     ToolType.ERASER to "橡皮"
                 )
                 otherTools.forEach { (tool, label) ->
-                    ToolBtn(viewModel, tool, label, onShowNumberDialog, onShowTextDialog)
+                    ToolBtn(viewModel, tool, label, onShowNumberDialog, onShowTextDialog, glass = glass)
                 }
             }
+        }
+
+        // 虚线间距面板：贴着“比例”文字上方弹出
+        if (dashPopup) {
+            val b = dashAnchor
+            val cfg = androidx.compose.ui.platform.LocalConfiguration.current
+            val panelW = with(LocalDensity.current) { 228.dp.roundToPx() }
+            val screenW = with(LocalDensity.current) { cfg.screenWidthDp.dp.roundToPx() }
+            val panelOffsetY = with(LocalDensity.current) { 96.dp.roundToPx() }
+            Popup(
+                offset = if (b != null)
+                    IntOffset(
+                        b.left.roundToInt().coerceIn(8, (screenW - panelW - 8).coerceAtLeast(8)),
+                        (b.top.roundToInt() - panelOffsetY).coerceAtLeast(8)
+                    )
+                else IntOffset.Zero,
+                onDismissRequest = { dashPopup = false },
+                properties = PopupProperties(focusable = true)
+            ) {
+                DashGapPanel(viewModel)
+            }
+        }
+    }
+}
+
+/**
+ * 虚线间距面板：一个滑块 = 间隔倍率（1× 对应 dash 12 / gap 8）。
+ * 有选中元素时改选中元素的虚线间隔，无选中时改当前线型（之后画的虚线生效）。
+ */
+@Composable
+private fun DashGapPanel(viewModel: DrawingViewModel) {
+    val selDashes = viewModel.selection.selectedIndices.mapNotNull {
+        viewModel.primitives.getOrNull(it)?.lineStyle?.dashLength
+    }
+    val baseMult = ((selDashes.maxOrNull() ?: viewModel.currentLineStyle.dashLength) / 12f)
+        .coerceIn(0.5f, 5f)
+    var mult by remember { mutableFloatStateOf(baseMult) }
+
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = Color(0xF52A2A2A),
+        shadowElevation = 10.dp,
+        modifier = Modifier.width(228.dp)
+    ) {
+        Column(Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("虚线间距", fontSize = 12.sp, color = Color(0xFFDDDDDD), fontWeight = FontWeight.Medium)
+                Spacer(Modifier.weight(1f))
+                Text("%.1f×".format(mult), fontSize = 11.sp, color = Color(0xFF64B5F6))
+            }
+            Spacer(Modifier.height(8.dp))
+            CompactSlider(
+                value = mult,
+                onValueChange = { v ->
+                    mult = v
+                    if (selDashes.isEmpty()) viewModel.setCurrentDashScale(v)
+                    else viewModel.updateSelectedDashScale(v)
+                },
+                valueRange = 0.5f..5f,
+                modifier = Modifier.fillMaxWidth().height(24.dp),
+                thumbSize = 10.dp
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "线段 %.0f   间隔 %.0f".format(12f * mult, 8f * mult),
+                fontSize = 10.sp, color = Color(0xFF999999)
+            )
         }
     }
 }
@@ -287,14 +391,52 @@ fun BottomToolbar(
 private fun DarkPill(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    glass: Boolean = false,
+    selected: Boolean = false,
     content: @Composable () -> Unit
 ) {
-    Surface(shape = RoundedCornerShape(16.dp), color = Color(0xDD333333), shadowElevation = 2.dp,
-        modifier = modifier.height(30.dp)) {
-        TextButton(onClick = onClick, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
-            modifier = Modifier.height(30.dp),
-            colors = ButtonDefaults.textButtonColors(contentColor = Color.White)) {
+    val shape = RoundedCornerShape(16.dp)
+    val brush: androidx.compose.ui.graphics.Brush = when {
+        !glass -> androidx.compose.ui.graphics.SolidColor(Color(0xDD333333))
+        selected -> androidx.compose.ui.graphics.Brush.verticalGradient(
+            listOf(Color(0xF21565C0), Color(0xD91565C0))
+        )
+        else -> androidx.compose.ui.graphics.Brush.verticalGradient(
+            listOf(Color(0xC7FFFFFF), Color(0x66E3F2FD))
+        )
+    }
+    // 外层不裁切：选中的彩边光晕要能画到按钮外面，裁切只作用在底色层上
+    Box(modifier.height(30.dp)) {
+        Box(
+            Modifier
+                .matchParentSize()
+                .clip(shape)
+                .background(brush)
+                .border(1.dp, if (glass) Color(0x80FFFFFF) else Color.Transparent, shape)
+        )
+        TextButton(
+            onClick = onClick,
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+            modifier = Modifier.fillMaxSize(),
+            colors = ButtonDefaults.textButtonColors(
+                contentColor = if (!glass || selected) Color.White else Color(0xFF2A2A2A)
+            )
+        ) {
             content()
+        }
+        if (selected) {
+            // 选中标记：一圈彩虹描边（8 秒转一圈；转速常驻不能太快，画图时抢注意力）
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .auroraRing(
+                        cornerRadius = 16.dp,
+                        ringWidth = 1.6.dp,
+                        glowWidth = 3.5.dp,
+                        glowStrength = 0.5f,
+                        spinSeconds = 8
+                    )
+            )
         }
     }
 }
@@ -316,9 +458,9 @@ private fun BluePill(
     }
 }
 
-/** Dark dropdown menu: uses SchedaDropdownMenu (no forced 8dp vertical padding). */
+/** Dark dropdown menu: uses SchedaDropdownMenu (no forced 8dp vertical padding). BoxScope 扩展：菜单要捕获父 Box（锚点）边界。 */
 @Composable
-private fun DarkDropdownMenu(
+private fun BoxScope.DarkDropdownMenu(
     expanded: Boolean,
     onDismissRequest: () -> Unit,
     modifier: Modifier = Modifier,
@@ -345,7 +487,7 @@ private fun DarkMenuItem(label: String, selected: Boolean, onClick: () -> Unit) 
             .padding(horizontal = 16.dp),
         contentAlignment = Alignment.CenterStart
     ) {
-        Text(label, fontSize = 14.sp, color = Color.White)
+        Text(label, fontSize = 14.sp, color = if (selected) Color.White else Color(0xFF2A2A2A))
     }
 }
 
@@ -355,18 +497,21 @@ private fun RowScope.ToolBtn(
     tool: ToolType,
     label: String,
     onShowNumberDialog: () -> Unit,
-    onShowTextDialog: () -> Unit = {}
+    onShowTextDialog: () -> Unit = {},
+    glass: Boolean = false,
 ) {
     val selected = viewModel.currentTool == tool
     DarkPill(onClick = {
+        viewModel.setTool(tool)
         when (tool) {
             ToolType.ANNOTATE -> onShowNumberDialog()
             ToolType.TEXT -> onShowTextDialog()
-            else -> viewModel.setTool(tool)
+            else -> {}
         }
-    }, modifier = Modifier.weight(1f)) {
+    }, modifier = Modifier.weight(1f), glass = glass, selected = selected) {
         Text(label, fontSize = 11.sp,
-            color = if (selected) Color.White else Color(0xFFAAAAAA),
+            color = if (!glass) (if (selected) Color.White else Color(0xFFAAAAAA))
+                    else (if (selected) Color.White else Color(0xFF2A2A2A)),
             maxLines = 1)
     }
 }
@@ -375,7 +520,7 @@ private fun RowScope.ToolBtn(
 //  LayerDialog
 // ═════════════════════════════════════════════════════════════════
 
-private data class LayerDragState(
+private class LayerDragState(
     val startIndex: Int,
     val startId: Int,
     var offsetY: Float
@@ -387,6 +532,7 @@ fun LayerDialog(
     viewModel: DrawingViewModel,
     onDismiss: () -> Unit
 ) {
+            GlassOverlayEffect()
     val layers = viewModel.layers
     val activeId = viewModel.activeLayerId
     var newLayerName by remember { mutableStateOf("") }
@@ -399,26 +545,41 @@ fun LayerDialog(
     var visualLayers by remember { mutableStateOf<List<Layer>>(layers) }
     var dragState by remember { mutableStateOf<LayerDragState?>(null) }
     val density = LocalDensity.current
-    val itemHeightPx = with(density) { 52.dp.toPx() }
+    val itemHeightPx = with(density) { 58.dp.toPx() }
 
     if (dragState == null) visualLayers = layers.toMutableList()
 
     Dialog(onDismissRequest = onDismiss) {
+            GlassOverlayEffect()
         Surface(
-            shape = RoundedCornerShape(16.dp),
-            color = Color(0xCC222222),
-            modifier = Modifier.width(320.dp)
+            shape = RoundedCornerShape(20.dp),
+            color = Color(0xE0FFFFFF),
+            border = BorderStroke(1.dp, Color(0xFF383838)),
+            modifier = Modifier.width(340.dp)
         ) {
-            Column(Modifier.padding(16.dp)) {
-                Text(
-                    "图层",
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White
-                )
+            Column(Modifier.padding(horizontal = 16.dp, vertical = 18.dp)) {
+                // ── 标题栏 ──
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Outlined.Layers, null, Modifier.size(18.dp),
+                        tint = Color(0xFF64B5F6)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("图层", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = Color(0xFF2A2A2A))
+                    Spacer(Modifier.width(8.dp))
+                    Surface(shape = RoundedCornerShape(8.dp), color = Color(0x14000000)) {
+                        Text(
+                            "${layers.size}", fontSize = 11.sp, color = Color(0xFF777777),
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
+                        )
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+                Text("点击设为当前图层 · 长按拖动排序", fontSize = 11.sp, color = Color(0xFF777777))
                 Spacer(Modifier.height(12.dp))
 
-                LazyColumn(Modifier.heightIn(max = 360.dp)) {
+                // ── 图层列表 ──
+                LazyColumn(Modifier.heightIn(max = 330.dp)) {
                     items(visualLayers.size, key = { visualLayers[it].id }) { idx ->
                         val layer = visualLayers[idx]
                         val isActive = layer.id == activeId
@@ -428,7 +589,7 @@ fun LayerDialog(
                         Surface(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(vertical = 2.dp)
+                                .padding(vertical = 3.dp)
                                 .animateItem(placementSpec = tween(120))
                                 .graphicsLayer {
                                     if (isDragging) {
@@ -476,43 +637,71 @@ fun LayerDialog(
                                     } else Modifier
                                 ),
                             shape = RoundedCornerShape(12.dp),
-                            color = if (isActive) Color(0xFF1565C0) else Color(0xDD333333),
-                            border = if (isDragging) BorderStroke(2.dp, Color(0xFF64B5F6)) else null,
+                            color = when {
+                                isDragging -> Color(0x1F64B5F6)
+                                isActive -> Color(0x1A1565C0)
+                                else -> Color(0x0F000000)
+                            },
+                            border = when {
+                                isDragging -> BorderStroke(1.5.dp, Color(0xFF64B5F6))
+                                isActive -> BorderStroke(1.dp, Color(0xFF4B9CD3))
+                                else -> null
+                            },
                             shadowElevation = if (isDragging) 8.dp else 0.dp
                         ) {
                             Row(
-                                Modifier.padding(horizontal = 8.dp, vertical = 8.dp),
+                                Modifier.height(52.dp).padding(start = 4.dp, end = 8.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
+                                // 显隐
                                 IconButton(
                                     onClick = { viewModel.toggleLayerVisibility(layer.id) },
                                     enabled = !isZero,
-                                    modifier = Modifier.size(28.dp)
+                                    modifier = Modifier.size(32.dp)
                                 ) {
                                     Icon(
                                         if (layer.isVisible) Icons.Outlined.Visibility else Icons.Outlined.VisibilityOff,
                                         contentDescription = "显隐",
                                         modifier = Modifier.size(18.dp),
-                                        tint = if (isZero) Color(0xFF888888) else Color.White
+                                        tint = when {
+                                            isZero -> Color(0xFF666666)
+                                            layer.isVisible -> Color(0xFF64B5F6)
+                                            else -> Color(0xFF666666)
+                                        }
                                     )
                                 }
-                                Text(
-                                    layer.name + if (isZero) " (底)" else "",
-                                    fontSize = 13.sp,
-                                    color = Color.White,
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .padding(horizontal = 4.dp),
-                                    maxLines = 1
-                                )
+                                // 名称（隐藏图层降透明度）
+                                Row(
+                                    Modifier.weight(1f).padding(horizontal = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        layer.name,
+                                        fontSize = 14.sp,
+                                        fontWeight = if (isActive) FontWeight.SemiBold else FontWeight.Normal,
+                                        color = if (layer.isVisible) Color(0xFF2A2A2A) else Color(0xFF888888),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    if (isZero) {
+                                        Spacer(Modifier.width(6.dp))
+                                        Surface(shape = RoundedCornerShape(4.dp), color = Color(0x1A000000)) {
+                                            Text(
+                                                "底", fontSize = 9.sp, color = Color(0xFF777777),
+                                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                                // 当前图层标记
                                 if (isActive) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(8.dp)
-                                            .background(Color.White, CircleShape)
+                                    Icon(
+                                        Icons.Outlined.CheckCircle, "当前图层",
+                                        Modifier.size(16.dp), tint = Color(0xFF64B5F6)
                                     )
                                     Spacer(Modifier.width(4.dp))
                                 }
+                                // 重命名
                                 if (!isZero) {
                                     IconButton(
                                         onClick = {
@@ -520,37 +709,42 @@ fun LayerDialog(
                                             renameValue = layer.name
                                             renameDlg = true
                                         },
-                                        modifier = Modifier.size(28.dp)
+                                        modifier = Modifier.size(30.dp)
                                     ) {
                                         Icon(
-                                            Icons.Outlined.Edit,
-                                            contentDescription = "重命名",
-                                            modifier = Modifier.size(18.dp),
-                                            tint = Color.White
+                                            Icons.Outlined.Edit, "重命名",
+                                            Modifier.size(16.dp), tint = Color(0xFFB0B0B0)
                                         )
                                     }
-                                    IconButton(
-                                        onClick = { viewModel.duplicateLayer(layer.id) },
-                                        modifier = Modifier.size(28.dp)
-                                    ) {
-                                        Icon(
-                                            Icons.Outlined.ContentCopy,
-                                            contentDescription = "复制",
-                                            modifier = Modifier.size(18.dp),
-                                            tint = Color.White
-                                        )
-                                    }
+                                }
+                                // 复制图层 — 所有图层都可以复制（含图层0）
+                                IconButton(
+                                    onClick = { viewModel.duplicateLayer(layer.id) },
+                                    modifier = Modifier.size(30.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Outlined.ContentCopy, "复制",
+                                        Modifier.size(16.dp), tint = Color(0xFFB0B0B0)
+                                    )
+                                }
+                                // 删除
+                                if (!isZero) {
                                     IconButton(
                                         onClick = { viewModel.deleteLayer(layer.id) },
-                                        modifier = Modifier.size(28.dp)
+                                        modifier = Modifier.size(30.dp)
                                     ) {
                                         Icon(
-                                            Icons.Outlined.Delete,
-                                            contentDescription = "删除",
-                                            modifier = Modifier.size(18.dp),
-                                            tint = Color(0xFFFF5252)
+                                            Icons.Outlined.Delete, "删除",
+                                            Modifier.size(16.dp), tint = Color(0xFFFF6B6B)
                                         )
                                     }
+                                    // 拖拽排序手柄（仅视觉提示，长按行任意位置均可拖动）
+                                    Icon(
+                                        Icons.Outlined.DragHandle, null,
+                                        Modifier.size(16.dp), tint = Color(0xFF666666)
+                                    )
+                                } else {
+                                    Spacer(Modifier.width(16.dp))
                                 }
                             }
                         }
@@ -559,32 +753,35 @@ fun LayerDialog(
 
                 Spacer(Modifier.height(12.dp))
 
-                // New layer
+                // ── 新建图层 ──
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    var tv by remember { mutableStateOf(TextFieldValue(newLayerName)) }
-                    OutlinedTextField(
-                        value = tv,
-                        onValueChange = { tv = it; newLayerName = it.text },
-                        label = { Text("新图层名", fontSize = 11.sp) },
-                        singleLine = true,
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(48.dp)
-                            .onFocusChanged {
-                                if (it.isFocused) tv = tv.copy(selection = TextRange(0, tv.text.length))
-                            },
-                        colors = TextFieldDefaults.colors(
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White,
-                            focusedContainerColor = Color.Transparent,
-                            unfocusedContainerColor = Color.Transparent,
-                            focusedIndicatorColor = Color(0xFF64B5F6),
-                            unfocusedIndicatorColor = Color(0xFF888888),
-                            focusedLabelColor = Color(0xFFAAAAAA),
-                            unfocusedLabelColor = Color(0xFFAAAAAA),
-                            cursorColor = Color(0xFF64B5F6)
-                        )
-                    )
+                    var tv by remember { mutableStateOf(TextFieldValue("")) }
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = Color(0x0F000000),
+                        border = BorderStroke(1.dp, Color(0xFF404042)),
+                        modifier = Modifier.weight(1f).height(44.dp)
+                    ) {
+                        Box(
+                            Modifier.fillMaxSize().padding(horizontal = 12.dp),
+                            contentAlignment = Alignment.CenterStart
+                        ) {
+                            BasicTextField(
+                                value = tv,
+                                onValueChange = { tv = it; newLayerName = it.text },
+                                singleLine = true,
+                                textStyle = TextStyle(color = Color(0xFF2A2A2A), fontSize = 13.sp),
+                                cursorBrush = SolidColor(Color(0xFF64B5F6)),
+                                modifier = Modifier.fillMaxWidth().onFocusChanged { if (it.isFocused && tv.text.isNotEmpty()) tv = tv.copy(selection = TextRange(0, tv.text.length)) },
+                                decorationBox = { inner ->
+                                    if (tv.text.isEmpty()) {
+                                        Text("新图层名称", fontSize = 13.sp, color = Color(0xFF777777))
+                                    }
+                                    inner()
+                                }
+                            )
+                        }
+                    }
                     Spacer(Modifier.width(8.dp))
                     Button(
                         onClick = {
@@ -593,39 +790,49 @@ fun LayerDialog(
                             newLayerName = ""
                             tv = TextFieldValue("")
                         },
+                        shape = RoundedCornerShape(12.dp),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = Color(0xFF1565C0),
                             contentColor = Color.White
                         ),
-                        modifier = Modifier.height(40.dp)
-                    ) { Text("新建", fontSize = 12.sp) }
+                        contentPadding = PaddingValues(horizontal = 14.dp),
+                        modifier = Modifier.height(44.dp)
+                    ) {
+                        Icon(Icons.Outlined.Add, null, Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("新建", fontSize = 13.sp)
+                    }
                 }
 
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(14.dp))
 
+                // ── 底部操作 ──
                 Row(
                     Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Button(
+                    OutlinedButton(
                         onClick = { viewModel.mergeLayerDown(activeId) },
                         enabled = activeId != 0,
-                        modifier = Modifier.weight(1f),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFF1565C0),
-                            contentColor = Color.White,
-                            disabledContainerColor = Color(0xFF555555),
-                            disabledContentColor = Color(0xFF888888)
-                        )
-                    ) { Text("合并到下层", fontSize = 12.sp) }
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(
+                            1.dp,
+                            if (activeId != 0) Color(0xFF4B9CD3) else Color(0xFF444444)
+                        ),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = if (activeId != 0) Color(0xFF64B5F6) else Color(0xFF666666)
+                        ),
+                        modifier = Modifier.weight(1f).height(42.dp)
+                    ) { Text("合并到下层", fontSize = 13.sp) }
                     Button(
                         onClick = onDismiss,
-                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(12.dp),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFF555555),
+                            containerColor = Color(0xFF1565C0),
                             contentColor = Color.White
-                        )
-                    ) { Text("关闭", fontSize = 12.sp) }
+                        ),
+                        modifier = Modifier.weight(1f).height(42.dp)
+                    ) { Text("关闭", fontSize = 13.sp) }
                 }
             }
         }
@@ -636,14 +843,25 @@ fun LayerDialog(
         LaunchedEffect(Unit) { delay(100); focusReq.requestFocus() }
         AlertDialog(
             onDismissRequest = { renameDlg = false; renameValue = ""; renameId = null },
-            title = { Text("重命名图层", fontSize = 16.sp) },
+            containerColor = Color(0xE0FFFFFF),
+            shape = RoundedCornerShape(20.dp),
+            title = {
+                Text("重命名图层", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color(0xFF2A2A2A))
+            },
             text = {
-                var tv by remember { mutableStateOf(TextFieldValue(renameValue)) }
+                var tv by remember { mutableStateOf(TextFieldValue(renameValue, selection = TextRange(0, renameValue.length))) }
                 OutlinedTextField(
                     tv,
                     { tv = it; renameValue = it.text },
                     label = { Text("名称") },
                     singleLine = true,
+                    shape = RoundedCornerShape(12.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = Color(0xFF64B5F6), unfocusedBorderColor = Color(0xFF555555),
+                        cursorColor = Color(0xFF64B5F6), focusedTextColor = Color(0xFF2A2A2A),
+                        unfocusedTextColor = Color(0xFF2A2A2A),
+                        focusedLabelColor = Color(0xFF64B5F6), unfocusedLabelColor = Color(0xFF888888)
+                    ),
                     modifier = Modifier
                         .focusRequester(focusReq)
                         .onFocusChanged { if (it.isFocused) tv = tv.copy(selection = TextRange(0, tv.text.length)) }
@@ -653,10 +871,12 @@ fun LayerDialog(
                 TextButton(onClick = {
                     renameId?.let { viewModel.renameLayer(it, renameValue.trim().ifBlank { "图层" }) }
                     renameDlg = false; renameValue = ""; renameId = null
-                }) { Text("确定") }
+                }) { Text("确定", color = Color(0xFF64B5F6), fontWeight = FontWeight.Bold) }
             },
             dismissButton = {
-                TextButton(onClick = { renameDlg = false; renameValue = ""; renameId = null }) { Text("取消") }
+                TextButton(onClick = { renameDlg = false; renameValue = ""; renameId = null }) {
+                    Text("取消", color = Color(0xFF777777))
+                }
             }
         )
     }
@@ -667,7 +887,7 @@ fun LayerDialog(
 // ═══════════════════════════════════════════════════════════
 
 private val PRESET_COLORS = listOf(
-    Color.Black, Color(0xFF333333), Color(0xFF666666),
+    Color.Black, Color(0x14000000), Color(0xFF666666),
     Color.Red, Color(0xFFD32F2F), Color(0xFFC62828),
     Color(0xFFFF9800), Color(0xFFF57C00), Color(0xFFE65100),
     Color(0xFFFFEB3B), Color(0xFFFDD835), Color(0xFFF9A825),
@@ -682,6 +902,7 @@ fun ColorPickerDialog(
     onColorSelected: (Color) -> Unit,
     onDismiss: () -> Unit
 ) {
+            GlassOverlayEffect()
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("选择颜色", fontSize = 16.sp) },
@@ -702,7 +923,7 @@ fun ColorPickerDialog(
                                     .background(color)
                                     .border(
                                         if (color == currentColor) 3.dp else 1.dp,
-                                        if (color == currentColor) Color(0xFF1976D2) else Color(0xFFCCCCCC),
+                                        if (color == currentColor) Color(0xFF1976D2) else Color(0xFF666666),
                                         CircleShape
                                     )
                                     .clickable { onColorSelected(color); onDismiss() }
@@ -729,6 +950,7 @@ fun StrokeWidthDialog(
     onWidthChanged: (Float) -> Unit,
     onDismiss: () -> Unit
 ) {
+            GlassOverlayEffect()
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("线宽", fontSize = 16.sp) },
@@ -754,12 +976,17 @@ fun CompactSlider(
     valueRange: ClosedFloatingPointRange<Float>,
     modifier: Modifier = Modifier,
     thumbSize: Dp = 8.dp,
-    trackHeight: Dp = 4.dp
+    trackHeight: Dp = 4.dp,
+    trackColor: Color = Color(0xFF4A4A4A),
+    activeColor: Color = Color(0xFF64B5F6),
+    enabled: Boolean = true
 ) {
     val density = LocalDensity.current
     val thumbSizePx = with(density) { thumbSize.toPx() }
     val thumbRadiusPx = thumbSizePx / 2f
     val trackHeightPx = with(density) { trackHeight.toPx() }
+    val ringPx = with(density) { 1.5.dp.toPx() }
+    val shadowOffsetPx = with(density) { 1.dp.toPx() }
 
     BoxWithConstraints(
         modifier = modifier,
@@ -772,40 +999,39 @@ fun CompactSlider(
             if (valueRange.endInclusive == valueRange.start) 0f
             else ((value - valueRange.start) / (valueRange.endInclusive - valueRange.start)).coerceIn(0f, 1f)
         }
+        // 拇指中心：fraction=0 时左边缘贴轨道起点，fraction=1 时右边缘贴轨道终点
         val thumbCenterX = thumbRadiusPx + fraction * (widthPx - thumbSizePx)
-        val thumbOffsetX = (thumbCenterX - widthPx / 2f).roundToInt()
-        val thumbOffsetY = 0
 
-        Canvas(modifier = Modifier.fillMaxWidth().height(trackHeight)) {
+        // 全部用 Canvas 一次绘制：轨道 + 激活段 + 拇指（阴影/白底/蓝环）
+        Canvas(modifier = Modifier.fillMaxSize()) {
             val centerY = size.height / 2f
             drawLine(
-                color = Color(0xFF3A3A3A),
-                start = Offset(0f, centerY),
-                end = Offset(size.width, centerY),
+                color = if (enabled) trackColor else Color(0xFF2A2A2A),
+                start = Offset(thumbRadiusPx, centerY),
+                end = Offset(size.width - thumbRadiusPx, centerY),
                 strokeWidth = trackHeightPx,
                 cap = StrokeCap.Round
             )
             drawLine(
-                color = Color(0xFF64B5F6),
-                start = Offset(0f, centerY),
+                color = if (enabled) activeColor else Color(0xFF3A3A3A),
+                start = Offset(thumbRadiusPx, centerY),
                 end = Offset(thumbCenterX, centerY),
                 strokeWidth = trackHeightPx,
                 cap = StrokeCap.Round
+            )
+            drawCircle(Color(0x66000000), thumbRadiusPx, Offset(thumbCenterX, centerY + shadowOffsetPx))
+            drawCircle(if (enabled) Color.White else Color(0xFF666666), thumbRadiusPx, Offset(thumbCenterX, centerY))
+            drawCircle(
+                if (enabled) activeColor else Color(0xFF4A4A4A), thumbRadiusPx - ringPx / 2f, Offset(thumbCenterX, centerY),
+                style = Stroke(width = ringPx)
             )
         }
 
         Box(
             modifier = Modifier
-                .offset { IntOffset(thumbOffsetX, thumbOffsetY) }
-                .size(thumbSize)
-                .clip(CircleShape)
-                .background(Color.White)
-        )
-
-        Box(
-            modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(valueRange) {
+                .pointerInput(valueRange, enabled) {
+                    if (!enabled) return@pointerInput
                     awaitPointerEventScope {
                         while (true) {
                             val down = awaitFirstDown()
@@ -844,4 +1070,79 @@ private fun updateSliderValue(
     val fraction = ((x - thumbSizePx / 2f) / (widthPx - thumbSizePx)).coerceIn(0f, 1f)
     val newValue = valueRange.start + fraction * (valueRange.endInclusive - valueRange.start)
     onValueChange(newValue)
+}
+
+// ═══════════════════════════════════════════════════════
+//  Array dialog — selection → grid pattern
+// ═══════════════════════════════════════════════════════
+
+@Composable
+fun ArrayDialog(
+    rows: Int, cols: Int, gapX: Float, gapY: Float,
+    onRowsChange: (Int) -> Unit,
+    onColsChange: (Int) -> Unit,
+    onGapXChange: (Float) -> Unit,
+    onGapYChange: (Float) -> Unit,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+            GlassOverlayEffect()
+    Dialog(onDismissRequest = onDismiss) {
+            GlassOverlayEffect()
+        Surface(shape = RoundedCornerShape(16.dp), color = Color(0xE0FFFFFF), modifier = Modifier.width(300.dp)) {
+            Column(Modifier.padding(16.dp)) {
+                Text("阵列", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color(0xFF2A2A2A))
+                Spacer(Modifier.height(12.dp))
+                // Row count stepper
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Text("行数", fontSize = 13.sp, color = Color(0xFF666666), modifier = Modifier.width(60.dp))
+                    IconButton(onClick = { onRowsChange(maxOf(1, rows - 1)) }, modifier = Modifier.size(28.dp)) {
+                        Text("−", fontSize = 16.sp, color = Color(0xFF2A2A2A))
+                    }
+                    Text("$rows", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color(0xFF2A2A2A), modifier = Modifier.width(30.dp), textAlign = TextAlign.Center)
+                    IconButton(onClick = { onRowsChange(rows + 1) }, modifier = Modifier.size(28.dp)) {
+                        Text("+", fontSize = 16.sp, color = Color(0xFF2A2A2A))
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                // Column count stepper
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Text("列数", fontSize = 13.sp, color = Color(0xFF666666), modifier = Modifier.width(60.dp))
+                    IconButton(onClick = { onColsChange(maxOf(1, cols - 1)) }, modifier = Modifier.size(28.dp)) {
+                        Text("−", fontSize = 16.sp, color = Color(0xFF2A2A2A))
+                    }
+                    Text("$cols", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color(0xFF2A2A2A), modifier = Modifier.width(30.dp), textAlign = TextAlign.Center)
+                    IconButton(onClick = { onColsChange(cols + 1) }, modifier = Modifier.size(28.dp)) {
+                        Text("+", fontSize = 16.sp, color = Color(0xFF2A2A2A))
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+                // Column gap slider
+                Text("列间距", fontSize = 12.sp, color = Color(0xFF666666))
+                Spacer(Modifier.height(4.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CompactSlider(value = gapX, onValueChange = onGapXChange, valueRange = 0f..400f,
+                        modifier = Modifier.weight(1f).height(24.dp), thumbSize = 10.dp, trackHeight = 8.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text("${gapX.toInt()}", fontSize = 12.sp, color = Color(0xFF2A2A2A), modifier = Modifier.width(32.dp), textAlign = TextAlign.End)
+                }
+                Spacer(Modifier.height(8.dp))
+                // Row gap slider
+                Text("行间距", fontSize = 12.sp, color = Color(0xFF666666))
+                Spacer(Modifier.height(4.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CompactSlider(value = gapY, onValueChange = onGapYChange, valueRange = 0f..400f,
+                        modifier = Modifier.weight(1f).height(24.dp), thumbSize = 10.dp, trackHeight = 8.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text("${gapY.toInt()}", fontSize = 12.sp, color = Color(0xFF2A2A2A), modifier = Modifier.width(32.dp), textAlign = TextAlign.End)
+                }
+                Spacer(Modifier.height(16.dp))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TextButton(onClick = onDismiss) { Text("取消", color = Color(0xFF888888)) }
+                    Spacer(Modifier.width(8.dp))
+                    TextButton(onClick = onConfirm) { Text("确定", color = Color(0xFF64B5F6), fontWeight = FontWeight.Bold) }
+                }
+            }
+        }
+    }
 }

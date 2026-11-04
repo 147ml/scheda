@@ -9,7 +9,7 @@ data class SelectionState(
     val selEndX: Float = 0f,
     val selEndY: Float = 0f,
     /** 选择方向 */
-    val direction: SelectDirection = SelectDirection.INSIDE_TOUCH,
+    val direction: SelectDirection = SelectDirection.FULLY_COVER,
     /** 被选中的基元索引 */
     val selectedIndices: Set<Int> = emptySet(),
     /** 选中包围盒（所有选中基元的并集） */
@@ -24,7 +24,20 @@ data class SelectionState(
     val action: SelectionAction = SelectionAction.NONE,
     /** 操作的参考点 */
     val refX: Float = 0f,
-    val refY: Float = 0f
+    val refY: Float = 0f,
+    /** 是否隐藏中间手柄（纯文字/数字选择时） */
+    val hideMidpoints: Boolean = false,
+    /** 选择变换参数（渲染时应用，不直接修改基元） */
+    val selScaleX: Float = 1f,
+    val selScaleY: Float = 1f,
+    val selOffsetX: Float = 0f,
+    val selOffsetY: Float = 0f,
+    /** 变换起始值（用于计算增量，避免世界坐标变换产生累积误差） */
+    val startRotation: Float = 0f,
+    val startScaleX: Float = 1f,
+    val startScaleY: Float = 1f,
+    val startX: Float = 0f,
+    val startY: Float = 0f
 ) {
     /** 选择框的标准化范围 */
     val left: Float get() = minOf(selStartX, selEndX)
@@ -46,7 +59,10 @@ data class PendingEdit(
     val scaleY: Float = 1f,
     /** 偏移量 */
     val offsetX: Float = 0f,
-    val offsetY: Float = 0f
+    val offsetY: Float = 0f,
+    /** 固定旋转轴（创建时记录，不随 bounds 漂移） */
+    val pivotX: Float = 0f,
+    val pivotY: Float = 0f
 ) {
     fun isActive() = active && primitive != null
 }

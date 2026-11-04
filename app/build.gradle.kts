@@ -1,39 +1,60 @@
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("com.chaquo.python")
 }
 
 android {
     namespace = "com.scheda.app"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.scheda.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 28
+        versionName = "3.5.0"
+
+        ndk {
+            // 默认只构建 arm64-v8a；需要在 x86_64 模拟器上调试时加：-PSCHEDA_X86=true
+            abiFilters += if (providers.gradleProperty("SCHEDA_X86").orNull == "true")
+                listOf("arm64-v8a", "x86_64") else listOf("arm64-v8a")
+        }
     }
 
+    chaquopy {
+        defaultConfig {
+            buildPython("python")
+            version = "3.11"
+            pip {
+                install("ezdxf")
+                install("numpy")
+            }
+        }
+    }
+
+    // 开源版适配：keystore 不入库，缺失时退回默认 debug 签名，保证 clone 后可直接构建
+    val releaseKeystore = rootProject.file("release.keystore")
     signingConfigs {
-        create("release") {
-            storeFile = file("../release.keystore")
-            storePassword = (providers.gradleProperty("SCHEDA_STORE_PASSWORD")
-                .orElse(System.getenv("SCHEDA_STORE_PASSWORD") ?: "scheda")).get()
-            keyAlias = "147ml"
-            keyPassword = (providers.gradleProperty("SCHEDA_KEY_PASSWORD")
-                .orElse(System.getenv("SCHEDA_KEY_PASSWORD") ?: "scheda")).get()
+        if (releaseKeystore.exists()) {
+            create("release") {
+                storeFile = releaseKeystore
+                storePassword = (providers.gradleProperty("SCHEDA_STORE_PASSWORD")
+                    .orElse(System.getenv("SCHEDA_STORE_PASSWORD") ?: "")).get()
+                keyAlias = (providers.gradleProperty("SCHEDA_KEY_ALIAS")
+                    .orElse(System.getenv("SCHEDA_KEY_ALIAS") ?: "147ml")).get()
+                keyPassword = (providers.gradleProperty("SCHEDA_KEY_PASSWORD")
+                    .orElse(System.getenv("SCHEDA_KEY_PASSWORD") ?: "")).get()
+            }
         }
     }
 
     buildTypes {
-        debug {
-            signingConfig = signingConfigs.getByName("release")
-        }
         release {
-            isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("release")
+            isMinifyEnabled = true
+            isShrinkResources = true
+            signingConfig = if (releaseKeystore.exists()) signingConfigs.getByName("release")
+                            else signingConfigs.getByName("debug")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -46,23 +67,23 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-
     buildFeatures {
         compose = true
     }
 
-    // APK 文件名带版本号
-    applicationVariants.all {
-        outputs.all {
-            val variant = this
-            if (variant is com.android.build.gradle.internal.api.BaseVariantOutputImpl) {
-                variant.outputFileName = "Schedav${versionName}.apk"
-            }
+    lint {
+        abortOnError = false
+    }
+
+    packaging {
+        resources {
+            excludes += setOf("META-INF/LICENSE.md", "META-INF/LICENSE-notice.md")
         }
     }
+}
+
+base {
+    archivesName = "Schedav${android.defaultConfig.versionName}"
 }
 
 dependencies {
@@ -75,14 +96,16 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.10.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.9.0")
 
-    // JSON 序列化
     implementation("com.google.code.gson:gson:2.11.0")
 
-    // 协程（viewModelScope）
+    // 液态玻璃效果（Kyant0 Backdrop，Apache 2.0）——NudgePad 微调键用
+    implementation("io.github.kyant0:backdrop:1.0.6")
+
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.0")
 
-    // SAF 文件操作
     implementation("androidx.documentfile:documentfile:1.0.1")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    testImplementation("junit:junit:4.13.2")
 }

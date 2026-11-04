@@ -1,0 +1,41 @@
+# Android build artifacts
+app/build/
+build/
+*.apk
+*.aab
+*.apk.*
+
+# IDE
+.idea/
+*.iml
+.gradle/
+
+# Kotlin build cache
+.kotlin/
+
+# Python generated artifacts
+**/__pycache__/
+*.pyc
+
+# Local config
+local.properties
+
+# Keystore files
+release.keystore
+*.keystore
+*.jks
+
+# Gradle wrapper
+gradle/wrapper/gradle-wrapper.jar.bak
+gradle/wrapper/gradle-wrapper.jar.new
+
+# OS files
+*.log
+.DS_Store
+Thumbs.db
+.venv/
+venv/
+node_modules/
+__pycache__/
+*.pyc
+dist/

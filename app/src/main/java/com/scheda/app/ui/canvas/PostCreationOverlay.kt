@@ -3,24 +3,18 @@ package com.scheda.app.ui.canvas
 import android.graphics.Paint
 import android.graphics.Typeface
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -30,765 +24,1060 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.focus.onFocusChanged
-import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.rotate
-import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.TextRange
-import androidx.compose.ui.text.input.TextFieldValue
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import com.scheda.app.model.DrawingPrimitive
 import com.scheda.app.model.BlockDef
+import com.scheda.app.ui.components.glassToolbarInset
+import com.scheda.app.model.Bounds
+import com.scheda.app.model.DrawingPrimitive
 import com.scheda.app.model.LineType
 import com.scheda.app.model.PendingEdit
+import com.scheda.app.model.Point2D
+import com.scheda.app.model.RangeLabelLayout
+import com.scheda.app.model.SelectionState
+import com.scheda.app.model.blockContentCentroid
+import com.scheda.app.model.blockMapPoint
+import com.kyant.backdrop.backdrops.LayerBackdrop
+import com.kyant.backdrop.drawBackdrop
+import com.kyant.backdrop.effects.blur
+import com.kyant.backdrop.effects.lens
+import com.kyant.backdrop.effects.vibrancy
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
-import kotlinx.coroutines.delay
 
+/**
+ * Unified overlay for both pending-edit (drawing/block) and selection modes.
+ *
+ * - When [pendingEdit] is active: show preview + confirm/cancel buttons.
+ * - When [selection] is non-null and has selected indices: show transform handles.
+ * - One Box, one pointer-input loop (pinch-to-zoom shared).
+ */
 @Composable
 fun PostCreationOverlay(
+    // ── Pending-edit mode params ──
     pendingEdit: PendingEdit,
-    onConfirm: () -> Unit,
-    onCancel: () -> Unit,
-    onUpdateOffset: (Float, Float) -> Unit,
-    onUpdateRotation: (Float) -> Unit,
-    onUpdateScale: (Float, Float) -> Unit,
+    onConfirm: () -> Unit = {},
+    onCancel: () -> Unit = {},
+    onUpdateOffset: (Float, Float) -> Unit = { _, _ -> },
+    onUpdateRotation: (Float) -> Unit = {},
+    onUpdateScale: (Float, Float) -> Unit = { _, _ -> },
+    onUpdatePrimitive: (DrawingPrimitive) -> Unit = {},
     onUpdateFontScale: (Float) -> Unit = {},
     onUpdateArrowSpan: (Float) -> Unit = {},
-    onUpdateRangeValue: (isStart: Boolean, value: Int) -> Unit = { _, _ -> },
     onToggleTextOrientation: () -> Unit = {},
     onToggleRangeReversed: () -> Unit = {},
     currentFontSize: Float = 40f,
-    onCanvasTransform: (zoom: Float, centroid: Offset, pan: Offset) -> Unit = { _, _, _ -> },
+    // ── Selection-mode params ──
+    selection: SelectionState? = null,
+    onMoveSelected: (Float, Float) -> Unit = { _, _ -> },
+    onRotateSelected: (Float) -> Unit = {},
+    onScaleSelected: (Float, Float) -> Unit = { _, _ -> },
+    onRectMidpointDrag: ((index: Int, r: Float) -> Unit)? = null,
+    rectDragHandleWorld: Offset? = null,
+    onTransformEnd: () -> Unit = {},
+    onHandleActiveChanged: (Boolean) -> Unit = {},
+    /** 选择态：单选直线拖端点（直接写回几何，不走变换参数） */
+    onMoveSelectedLineEndpoint: (isStart: Boolean, x: Float, y: Float) -> Unit = { _, _, _ -> },
+    /** 选择态：一次拖动结束（端点球与线身共用收尾：结束变换会话 + 落盘） */
+    onSelectionDragEnd: () -> Unit = {},
+    // 正交锁定：旋转角手柄点击 90°（待确认态 / 选择态两套回调）
+    orthoStep: Boolean = false,
+    onStepRotatePending: (Float) -> Unit = {},
+    onStepRotateSelected: (Float) -> Unit = {},
+    primitives: List<DrawingPrimitive> = emptyList(),
+    // ── Shared params ──
+    canvasBackdrop: LayerBackdrop? = null,
     modifier: Modifier = Modifier,
     canvasScale: Float = 1f,
     canvasOffsetX: Float = 0f,
     canvasOffsetY: Float = 0f,
     globalLineScale: Float = 1f,
-    blockDefs: List<BlockDef> = emptyList()
+    blockDefs: List<BlockDef> = emptyList(),
 ) {
-    if (!pendingEdit.isActive() || pendingEdit.bounds == null) return
+    val showPending = pendingEdit.isActive() && pendingEdit.bounds != null
+    val showSelection = selection != null && selection.selectedIndices.isNotEmpty()
+    val showSelectRect = selection != null && selection.isActive
+    if (!showPending && !showSelection && !showSelectRect) return
 
-    val bounds = pendingEdit.bounds!!
-    val handleSize = 40.dp
     val density = LocalDensity.current
-    val handleRadiusPx = with(density) { handleSize.toPx() / 2f }
-    val ctState = rememberUpdatedState(onCanvasTransform)
-    val csState = rememberUpdatedState(canvasScale)
 
-    val cx = (bounds.minX + bounds.maxX) / 2f + pendingEdit.offsetX
-    val cy = (bounds.minY + bounds.maxY) / 2f + pendingEdit.offsetY
-    // Minimum half-extent in screen pixels (so corner handles don't collapse)
+    // State wrappers so Canvas draw lambdas re-execute when values change
+    // 注意：不用 rememberUpdatedState 包装 pendingEdit——直接在 drawBlock 里读参数，
+    // PostCreationOverlay 重组时 lambda 必然新建，Canvas 必然重绘。
+    val csState2 = rememberUpdatedState(canvasScale)
+    val coxState = rememberUpdatedState(canvasOffsetX)
+    val coyState = rememberUpdatedState(canvasOffsetY)
+    val glsState = rememberUpdatedState(globalLineScale)
+    val bdState = rememberUpdatedState(blockDefs)
+    val selState = rememberUpdatedState(selection)
+
+    // ── 待确认矩形中点拖拽 锁定状态（2026-10-13，越界翻转修复）──
+    // 会话=400ms 无事件视为结束（待确认模式无显式拖动会话边界）。
+    // 首帧规范化 corners + 锁定被拖边身份；后续帧只动锁定两点/带符号量，越过对边自然翻转。
+    var peRectDragTime by remember { mutableStateOf(0L) }
+    var peRectDragIdx by remember { mutableStateOf(-1) }
+    var peRectDragPair by remember { mutableStateOf<IntArray?>(null) }
+    var peRectDragNx by remember { mutableStateOf(0f) }
+    var peRectDragNy by remember { mutableStateOf(0f) }
+    var peRectDragRotStat by remember { mutableStateOf<FloatArray?>(null) }
+    var peRectDragRotNx by remember { mutableStateOf(0f) }
+    var peRectDragRotNy by remember { mutableStateOf(0f) }
+    var peRectDragHandle by remember { mutableStateOf<Offset?>(null) }
+
+    fun peRectDragApply(pfoIdx: Int, amount: Float) {
+        var p = pendingEdit.primitive as? DrawingPrimitive.RectanglePrimitive ?: return
+        val now = System.currentTimeMillis()
+        val newSession = now - peRectDragTime > 400L || peRectDragIdx != pfoIdx
+        peRectDragTime = now
+        if (newSession) {
+            peRectDragIdx = pfoIdx
+            val edgeIdx = intArrayOf(0, 2, 3, 1)[pfoIdx.coerceIn(0, 3)]
+            val norm0 = p.normalizedCorners()
+            if (norm0.size == 4) {
+                p = p.copy(corners = norm0)
+                onUpdatePrimitive(p)
+            }
+            peRectDragPair = intArrayOf(edgeIdx, (edgeIdx + 1) % 4)
+            val lnx: Float; val lny: Float
+            when (edgeIdx) {
+                0 -> { lnx = 0f; lny = -1f }
+                1 -> { lnx = 1f; lny = 0f }
+                2 -> { lnx = 0f; lny = 1f }
+                else -> { lnx = -1f; lny = 0f }
+            }
+            val rot = p.rotation
+            if (abs(rot) < 0.001f) {
+                peRectDragRotStat = null
+                peRectDragNx = lnx; peRectDragNy = lny
+            } else {
+                val cosP = cos(rot); val sinP = sin(rot)
+                peRectDragNx = lnx * cosP - lny * sinP
+                peRectDragNy = lnx * sinP + lny * cosP
+                val xs = norm0.map { it.x }; val ys = norm0.map { it.y }
+                val cAx = (xs.min() + xs.max()) / 2f; val cAy = (ys.min() + ys.max()) / 2f
+                val hx0 = (xs.max() - xs.min()) / 2f; val hy0 = (ys.max() - ys.min()) / 2f
+                peRectDragRotStat = floatArrayOf(
+                    cAx, cAy,
+                    if (edgeIdx == 3) -hx0 else hx0,
+                    if (edgeIdx == 0) -hy0 else hy0
+                )
+                peRectDragRotNx = lnx; peRectDragRotNy = lny
+            }
+        }
+        val rotStat = peRectDragRotStat
+        val pair = peRectDragPair
+        val np: DrawingPrimitive.RectanglePrimitive
+        if (rotStat != null) {
+            // 旋转：边沿世界法向移 amount ⇔ 局部系：中心 += nLocal·(amount/2)；带符号半宽 += amount/2
+            val half = amount / 2f
+            val cAx = rotStat[0] + peRectDragRotNx * half
+            val cAy = rotStat[1] + peRectDragRotNy * half
+            val hx = rotStat[2] + (if (peRectDragRotNx != 0f) half else 0f)
+            val hy = rotStat[3] + (if (peRectDragRotNy != 0f) half else 0f)
+            peRectDragRotStat = floatArrayOf(cAx, cAy, hx, hy)
+            np = p.copy(corners = listOf(
+                Point2D(cAx - hx, cAy - hy), Point2D(cAx + hx, cAy - hy),
+                Point2D(cAx + hx, cAy + hy), Point2D(cAx - hx, cAy + hy)
+            ))
+        } else if (pair != null) {
+            // 未旋转：锁定两点沿首帧法向移动（允许交叉=负宽翻转，边身份持续）
+            val nc = p.corners.toMutableList()
+            if (nc.size == 4) {
+                for (k in pair) {
+                    val pt = nc[k]
+                    nc[k] = Point2D(pt.x + peRectDragNx * amount, pt.y + peRectDragNy * amount)
+                }
+            }
+            np = p.copy(corners = nc)
+        } else return
+        onUpdatePrimitive(np)
+        // 被拖边中点（世界/存储坐标），供 PFO 让被拖手柄跟随显示
+        val hRot = np.rotation
+        peRectDragHandle = if (abs(hRot) < 0.001f) {
+            val pr = peRectDragPair
+            if (pr == null) null else {
+                val a = np.corners[pr[0]]; val b = np.corners[pr[1]]
+                Offset((a.x + b.x) / 2f, (a.y + b.y) / 2f)
+            }
+        } else {
+            val s = peRectDragRotStat
+            if (s == null) null else {
+                val mx = if (peRectDragRotNx != 0f) s[0] + s[2] else s[0]
+                val my = if (peRectDragRotNy != 0f) s[1] + s[3] else s[1]
+                val cosP = cos(hRot); val sinP = sin(hRot)
+                val dx = mx - s[0]; val dy = my - s[1]
+                Offset(s[0] + dx * cosP - dy * sinP, s[1] + dx * sinP + dy * cosP)
+            }
+        }
+    }
+
+    // ── Pending-edit specific values ──
     val minHalf = with(density) { 30.dp.toPx() }
     val textMeasurePaint = Paint().apply {
-        typeface = Typeface.DEFAULT_BOLD
-        isAntiAlias = true
-        textAlign = Paint.Align.CENTER
+        typeface = Typeface.DEFAULT_BOLD; isAntiAlias = true; textAlign = Paint.Align.CENTER
     }
-    val (halfW, halfH) = when (val p = pendingEdit.primitive) {
-        is DrawingPrimitive.TextPrimitive -> {
-            val avgScale = sqrt(abs(pendingEdit.scaleX * pendingEdit.scaleY))
-            val lineScale = globalLineScale * p.lineScaleFactor
-            textMeasurePaint.textSize = p.fontSize * avgScale * lineScale * 1.3f
-            val textWidth = textMeasurePaint.measureText(p.text)
-            val fm = textMeasurePaint.fontMetrics
-            Pair(
-                maxOf(textWidth / 2f, minHalf / canvasScale),
-                maxOf((fm.descent - fm.ascent) / 2f, minHalf / canvasScale)
-            )
-        }
-        is DrawingPrimitive.NumberLabelPrimitive -> {
-            val avgScale = sqrt(abs(pendingEdit.scaleX * pendingEdit.scaleY))
-            val lineScale = globalLineScale * p.lineScaleFactor
-            textMeasurePaint.textSize = p.fontSize * avgScale * lineScale * 1.3f
-            val textWidth = textMeasurePaint.measureText(p.value.toString())
-            val fm = textMeasurePaint.fontMetrics
-            Pair(
-                maxOf(textWidth / 2f, minHalf / canvasScale),
-                maxOf((fm.descent - fm.ascent) / 2f, minHalf / canvasScale)
-            )
-        }
-        else -> {
-            val w = maxOf(((bounds.maxX - bounds.minX) / 2f) * pendingEdit.scaleX, minHalf / canvasScale)
-            val h = maxOf(((bounds.maxY - bounds.minY) / 2f) * pendingEdit.scaleY, minHalf / canvasScale)
-            Pair(w, h)
-        }
-    }
-    // Frame rotation = pending edit handle rotation + primitive's intrinsic rotation
-    val primFrameRot = when (val p = pendingEdit.primitive) {
-        is DrawingPrimitive.RangeLabelPrimitive -> p.rotation
-        is DrawingPrimitive.NumberLabelPrimitive -> p.rotation
-        is DrawingPrimitive.TextPrimitive -> p.rotation
-        is DrawingPrimitive.BlockRefPrimitive -> p.rotation
-        is DrawingPrimitive.RectanglePrimitive -> p.rotation
-        else -> 0f
-    }
-    val totalFrameRotation = pendingEdit.rotation + primFrameRot
-    val cosR = cos(totalFrameRotation); val sinR = sin(totalFrameRotation)
+    val (customHw, customHh) = if (showPending) {
+        val pe = pendingEdit
+        val dims = pe.primitive?.let { computePrimitiveHalfDims(it, pe.scaleX, pe.scaleY, globalLineScale, canvasScale, minHalf, textMeasurePaint, blockDefs) }
+        Pair(dims?.first, dims?.second)
+    } else null to null
 
-    fun worldToScreen(wx: Float, wy: Float): Offset =
-        Offset(wx * canvasScale + canvasOffsetX, wy * canvasScale + canvasOffsetY)
+    val primFrameRot = if (showPending) pendingEdit.primitive?.intrinsicRotation ?: 0f else 0f
+    val totalFrameRotation = if (showPending) pendingEdit.rotation + primFrameRot else 0f
 
-    fun localToScreen(lx: Float, ly: Float): Offset {
-        val rx = lx * cosR - ly * sinR + cx; val ry = lx * sinR + ly * cosR + cy
-        return worldToScreen(rx, ry)
-    }
-
-    val corners = listOf(
-        localToScreen(-halfW, -halfH), localToScreen(+halfW, -halfH),
-        localToScreen(-halfW, +halfH), localToScreen(+halfW, +halfH),
-    )
-    val centerScreen = worldToScreen(cx, cy)
-
-    // Calculate padded corners for the blue frame AND handles
-    val paddingPx = with(density) { 20.dp.toPx() }
-    val paddedCorners = corners.map { c ->
-        val dx = c.x - centerScreen.x
-        val dy = c.y - centerScreen.y
-        val dist = sqrt(dx * dx + dy * dy)
-        if (dist > 0.01f) {
-            Offset(c.x + (dx / dist) * paddingPx, c.y + (dy / dist) * paddingPx)
-        } else c
-    }
-
-    // Midpoints on the blue padded frame edges (only for non-text/number primitives)
-    val isTextNum = pendingEdit.primitive is DrawingPrimitive.TextPrimitive ||
-                    pendingEdit.primitive is DrawingPrimitive.NumberLabelPrimitive
-    val isRange = pendingEdit.primitive is DrawingPrimitive.RangeLabelPrimitive
-    val allMidpoints = if (isTextNum) emptyList()
-        else if (isRange) listOf(
-            Offset((paddedCorners[0].x + paddedCorners[2].x) / 2f, (paddedCorners[0].y + paddedCorners[2].y) / 2f),  // left only
-            Offset((paddedCorners[1].x + paddedCorners[3].x) / 2f, (paddedCorners[1].y + paddedCorners[3].y) / 2f),  // right only
-        )
-        else listOf(
-        Offset((paddedCorners[0].x + paddedCorners[1].x) / 2f, (paddedCorners[0].y + paddedCorners[1].y) / 2f),  // top
-        Offset((paddedCorners[2].x + paddedCorners[3].x) / 2f, (paddedCorners[2].y + paddedCorners[3].y) / 2f),  // bottom
-        Offset((paddedCorners[0].x + paddedCorners[2].x) / 2f, (paddedCorners[0].y + paddedCorners[2].y) / 2f),  // left
-        Offset((paddedCorners[1].x + paddedCorners[3].x) / 2f, (paddedCorners[1].y + paddedCorners[3].y) / 2f),  // right
-    )
-    val topLen = (paddedCorners[1] - paddedCorners[0]).getDistance()
-    val botLen = (paddedCorners[3] - paddedCorners[2]).getDistance()
-    val leftLen = (paddedCorners[2] - paddedCorners[0]).getDistance()
-    val rightLen = (paddedCorners[3] - paddedCorners[1]).getDistance()
-    val finalMidpoints = allMidpoints
+    val isTextNum = showPending && (pendingEdit.primitive is DrawingPrimitive.TextPrimitive ||
+        pendingEdit.primitive is DrawingPrimitive.NumberLabelPrimitive)
+    val isRange = showPending && pendingEdit.primitive is DrawingPrimitive.RangeLabelPrimitive
 
     Box(
-        modifier = modifier
-            .fillMaxSize()
-            .pointerInput(Unit) {
-                awaitPointerEventScope {
-                    var hadMulti = false
-                    while (true) {
-                        val event = awaitPointerEvent(PointerEventPass.Initial)
-                        val pressed = event.changes.filter { it.pressed }
-                        val sc = canvasScale
-                        if (pressed.size >= 2) {
-                            hadMulti = true
-                            val ctf = ctState.value
-                            val zoom = if (pressed.size >= 2) {
-                                val dx1 = pressed[0].position.x - pressed[1].position.x
-                                val dy1 = pressed[0].position.y - pressed[1].position.y
-                                val d1 = sqrt(dx1 * dx1 + dy1 * dy1)
-                                val dx2 = pressed[0].previousPosition.x - pressed[1].previousPosition.x
-                                val dy2 = pressed[0].previousPosition.y - pressed[1].previousPosition.y
-                                val d2 = sqrt(dx2 * dx2 + dy2 * dy2)
-                                if (d2 > 0f) d1 / d2 else 1f
-                            } else 1f
-                            val centroid = if (pressed.isNotEmpty()) Offset(
-                                pressed.map { it.position.x }.average().toFloat(),
-                                pressed.map { it.position.y }.average().toFloat()
-                            ) else Offset.Zero
-                            val prevCentroid = if (pressed.isNotEmpty()) Offset(
-                                pressed.map { it.previousPosition.x }.average().toFloat(),
-                                pressed.map { it.previousPosition.y }.average().toFloat()
-                            ) else Offset.Zero
-                            val pan = centroid - prevCentroid
-                            ctf(zoom, centroid, pan)
-                            pressed.forEach { ch -> ch.consume() }
-                        } else if (hadMulti && pressed.isEmpty()) {
-                            hadMulti = false
-                        }
-                        // single-touch falls through to children
-                    }
-                }
-            }
+        modifier = modifier.fillMaxSize()
     ) {
-        // Layer 1: non-interactive Canvas
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            val primitive = pendingEdit.primitive
-            if (primitive != null) drawPrimitiveAt(primitive, pendingEdit, canvasScale, canvasOffsetX, canvasOffsetY, globalLineScale * primitive.lineScaleFactor, blockDefs)
-
-            val colors = listOf(Color(0xFF34A853), Color(0xFFFF9800), Color(0xFFFF9800), Color(0xFF34A853))
-                val labels = listOf("", "↻", "↺", "")
-                for ((i, c) in paddedCorners.withIndex()) {
-                val bg = colors[i].copy(alpha = 0.2f)
-                drawCircle(bg, handleRadiusPx, c)
-                drawCircle(colors[i], handleRadiusPx, c, style = Stroke(width = 2.5f))
-                if (labels[i].isNotEmpty()) {
-                    val p = Paint().apply {
-                        this.color = colors[i].hashCode()
-                        textSize = handleRadiusPx * 1.2f; textAlign = Paint.Align.CENTER; isAntiAlias = true
-                    }
-                    val nc = drawContext.canvas.nativeCanvas
-                    val textX = c.x; val textY = c.y + handleRadiusPx * 0.35f
-                    nc.drawText(labels[i], textX, textY, p)
-                } else {
-                    // Scale corners: two smaller outward-pointing arrows rotating with the frame
-                    val arrowRotDeg = totalFrameRotation * 180f / kotlin.math.PI.toFloat()
-                    val nc = drawContext.canvas.nativeCanvas
-                    nc.save()
-                    nc.translate(c.x, c.y)
-                    nc.rotate(arrowRotDeg)
-                    val r = handleRadiusPx * 0.32f
-                    val strokeW = 2.5f
-                    val headLen = handleRadiusPx * 0.16f
-                    val headAngle = 30f * kotlin.math.PI.toFloat() / 180f
-                    val isTopLeft = i == 0
-                    val arrows = if (isTopLeft) listOf(
-                        Triple(Offset(0f, r), Offset(0f, -r), 270f * kotlin.math.PI.toFloat() / 180f), // up
-                        Triple(Offset(r, 0f), Offset(-r, 0f), 180f * kotlin.math.PI.toFloat() / 180f)  // left
-                    ) else listOf(
-                        Triple(Offset(0f, -r), Offset(0f, r), 90f * kotlin.math.PI.toFloat() / 180f),  // down
-                        Triple(Offset(-r, 0f), Offset(r, 0f), 0f)                                      // right
-                    )
-                    for ((start, end, dirAngle) in arrows) {
-                        drawLine(colors[i], start, end, strokeW, StrokeCap.Round)
-                        val backAngle = dirAngle + kotlin.math.PI.toFloat()
-                        val a1 = backAngle + headAngle
-                        val a2 = backAngle - headAngle
-                        drawLine(colors[i], end, Offset(end.x + headLen * kotlin.math.cos(a1), end.y + headLen * kotlin.math.sin(a1)), strokeW, StrokeCap.Round)
-                        drawLine(colors[i], end, Offset(end.x + headLen * kotlin.math.cos(a2), end.y + headLen * kotlin.math.sin(a2)), strokeW, StrokeCap.Round)
-                    }
-                    nc.restore()
-                }
+        // ══════════════════════════════════════════════════════
+        //  SELECTION MODE — selection rectangle (while dragging)
+        // ══════════════════════════════════════════════════════
+        if (selection != null && selection.isActive) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val selColor = Color(0x334B9CD3)
+                val borderColor = Color(0xFF4B9CD3)
+                val sx = selection.selStartX * canvasScale + canvasOffsetX
+                val sy = selection.selStartY * canvasScale + canvasOffsetY
+                val ex = selection.selEndX * canvasScale + canvasOffsetX
+                val ey = selection.selEndY * canvasScale + canvasOffsetY
+                val left = minOf(sx, ex); val top = minOf(sy, ey)
+                val right = maxOf(sx, ex); val bottom = maxOf(sy, ey)
+                drawRect(selColor, Offset(left, top), Size(right - left, bottom - top))
+                drawRect(borderColor, Offset(left, top), Size(right - left, bottom - top),
+                    style = Stroke(width = 2f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 6f))))
             }
-
-            // Midpoint resize handles (rounded-rect pills on each edge)
-            val midHw = with(density) { 13.dp.toPx() }
-            val midHh = with(density) { 7.dp.toPx() }
-            val midR = with(density) { 4.dp.toPx() }
-            val midColor = Color(0xFF4B9CD3)
-            for ((i, m) in finalMidpoints.withIndex()) {
-                // Range side handles always vertical pill; rotation aligns with edge
-                val isHorizontal = if (isRange) false else i < 2
-                val hw = if (isHorizontal) midHw else midHh
-                val hh = if (isHorizontal) midHh else midHw
-                val tl = Offset(m.x - hw, m.y - hh)
-                val sz = Size(hw * 2, hh * 2)
-                val midRot = totalFrameRotation * 180f / kotlin.math.PI.toFloat()
-                if (kotlin.math.abs(midRot) > 1f) {
-                    // Use native canvas translate->rotate so the rect stays centered on
-                    // the midpoint and ONLY its orientation changes.  DrawScope.rotate()
-                    // applies the offset BEFORE rotating, which moves the pill to a
-                    // completely different world position (the "flying-off" bug).
-                    val nc = drawContext.canvas.nativeCanvas
-                    nc.save()
-                    nc.translate(m.x, m.y)
-                    nc.rotate(midRot)
-                    drawRoundRect(Color.White, Offset(-hw, -hh), sz, CornerRadius(midR))
-                    drawRoundRect(midColor, Offset(-hw, -hh), sz, CornerRadius(midR), style = Stroke(width = 2f))
-                    nc.restore()
-                } else {
-                    drawRoundRect(Color.White, tl, sz, CornerRadius(midR))
-                    drawRoundRect(midColor, tl, sz, CornerRadius(midR), style = Stroke(width = 2f))
-                }
-            }
-
-            // Semi-transparent light blue frame through corner centers (circles drawn on top cover the joins)
-            val lightBlue = Color(0x404B9CD3)
-                val framePath = Path().apply {
-                    moveTo(paddedCorners[0].x, paddedCorners[0].y)
-                    lineTo(paddedCorners[1].x, paddedCorners[1].y)
-                    lineTo(paddedCorners[3].x, paddedCorners[3].y)
-                    lineTo(paddedCorners[2].x, paddedCorners[2].y)
-                    close()
-                }
-                drawPath(framePath, lightBlue, style = Stroke(width = 3f))
-                // Also fill with very faint light blue
-                drawPath(framePath, lightBlue.copy(alpha = 0.12f))
         }
 
-        // Layer 1.5: range edit dialog (triggered from bottom toolbar, status bar removed)
-        val pendingPrimitive = pendingEdit.primitive
-        if (pendingPrimitive is DrawingPrimitive.RangeLabelPrimitive) {
-            val prim = pendingPrimitive
-            var showRangeEditDlg by remember { mutableStateOf(false) }
-            // Range number edit dialog
-            if (showRangeEditDlg) {
-                val focusEnd = remember { FocusRequester() }
-                val svInit = prim.startValue.toString()
-                val evInit = prim.endValue.toString()
-                var svTv by remember { mutableStateOf(TextFieldValue(svInit)) }
-                var evTv by remember { mutableStateOf(TextFieldValue(evInit)) }
-                LaunchedEffect(Unit) { delay(100); focusEnd.requestFocus() }
-                AlertDialog(onDismissRequest = { showRangeEditDlg = false },
-                    title = { Text("区间数字") }, text = {
-                        Column {
-                            OutlinedTextField(svTv, { svTv = it },
-                                label = { Text("首数字") }, singleLine = true,
-                                modifier = Modifier.onFocusChanged { if (it.isFocused) svTv = svTv.copy(selection = TextRange(0, svTv.text.length)) },
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
-                            Spacer(Modifier.height(4.dp))
-                            OutlinedTextField(evTv, { evTv = it },
-                                label = { Text("尾数字") }, singleLine = true,
-                                modifier = Modifier.focusRequester(focusEnd).onFocusChanged { if (it.isFocused) evTv = evTv.copy(selection = TextRange(0, evTv.text.length)) },
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
-                        }
-                    }, confirmButton = {
-                        TextButton(onClick = {
-                            val s = svTv.text.filter { c -> c.isDigit() }.toIntOrNull() ?: prim.startValue
-                            val e = evTv.text.filter { c -> c.isDigit() }.toIntOrNull() ?: prim.endValue
-                            onUpdateRangeValue(true, s)
-                            onUpdateRangeValue(false, e)
-                            showRangeEditDlg = false
-                        }) { Text("确定") }
-                    }, dismissButton = {
-                        TextButton(onClick = { showRangeEditDlg = false }) { Text("取消") }
-                    })
+        // ══════════════════════════════════════════════════════
+        //  PADDED FRAME (shared between pending-edit + selection)
+        // ══════════════════════════════════════════════════════
+        if (showPending) {
+            // ── Pending-edit mode ──
+            // 矩形/圆/直线：框中心 = 元素当前中心经 scale/rotation 变换后的位置（pivot 为固定轴），
+            // 中点手柄锚定拖拽（对边/对点固定）时元素中心会移动，保证包围盒始终包裹元素
+            val pePrim = pendingEdit.primitive
+            val peIsLine = pePrim is DrawingPrimitive.LinePrimitive
+            val peCenter: Point2D? = when (pePrim) {
+                is DrawingPrimitive.RectanglePrimitive -> {
+                    val xs = pePrim.corners.map { it.x }; val ys = pePrim.corners.map { it.y }
+                    Point2D((xs.min() + xs.max()) / 2f, (ys.min() + ys.max()) / 2f)
+                }
+                is DrawingPrimitive.CirclePrimitive -> Point2D(pePrim.centerX, pePrim.centerY)
+                is DrawingPrimitive.LinePrimitive -> Point2D((pePrim.startX + pePrim.endX) / 2f, (pePrim.startY + pePrim.endY) / 2f)
+                else -> null
             }
-            Unit
-        }
-
-        // Layer 2: body drag (below handles so handles receive touch first)
-        val bx = paddedCorners.minOf { it.x }; val by = paddedCorners.minOf { it.y }
-        val bw = paddedCorners.maxOf { it.x } - bx; val bh = paddedCorners.maxOf { it.y } - by
-        if (bw > 20f && bh > 20f) {
-            val scaleState2 = rememberUpdatedState(canvasScale)
-            Box(Modifier.offset { IntOffset(bx.toInt(), by.toInt()) }
-                .size(with(density) { bw.toDp() }, with(density) { bh.toDp() })
-                .pointerInput(Unit) {
-                    detectDragGestures { ch, da ->
-                        ch.consume()
-                        val sc = scaleState2.value
-                        onUpdateOffset(da.x / sc, da.y / sc)    // 全向移动
-                    }
-                })
-        }
-
-        // Layer 3: corner handles (on top of body drag)
-        for ((i, corner) in paddedCorners.withIndex()) {
-            val cornerState = rememberUpdatedState(corner)
-            val centerState = rememberUpdatedState(centerScreen)
-            val peState = rememberUpdatedState(pendingEdit)
-            val scaleState = rememberUpdatedState(canvasScale)
-            Box(
-                modifier = Modifier
-                    .offset { IntOffset((corner.x - handleRadiusPx).toInt(), (corner.y - handleRadiusPx).toInt()) }
-                    .size(handleSize).clip(CircleShape)
-                    .pointerInput(Unit) {
-                        detectDragGestures { change, dragAmount ->
-                            change.consume()
-                            val c = cornerState.value; val cs = centerState.value; val pe = peState.value; val sc = scaleState.value
-                            val dxW = dragAmount.x / sc; val dyW = dragAmount.y / sc
-                            val hx = c.x - cs.x; val hy = c.y - cs.y; val dsq = hx * hx + hy * hy
-                            when (i) {
-                                0 -> { if (dsq > 1f) { val r = (hx * dragAmount.x + hy * dragAmount.y) / dsq; onUpdateScale(1f + r, 1f + r) } }
-                                1 -> { if (dsq > 1f) onUpdateRotation(pe.rotation + (hx * dragAmount.y - hy * dragAmount.x) / dsq) }
-                                2 -> { if (dsq > 1f) onUpdateRotation(pe.rotation + (hx * dragAmount.y - hy * dragAmount.x) / dsq) }
-                                3 -> { if (dsq > 1f) { val r = (hx * dragAmount.x + hy * dragAmount.y) / dsq; onUpdateScale(1f + r, 1f + r) } }
+            val (peFrameCx, peFrameCy) = if (peCenter != null) {
+                val ddx = (peCenter.x - pendingEdit.pivotX) * pendingEdit.scaleX
+                val ddy = (peCenter.y - pendingEdit.pivotY) * pendingEdit.scaleY
+                val cosPe = cos(pendingEdit.rotation); val sinPe = sin(pendingEdit.rotation)
+                Pair(pendingEdit.pivotX + ddx * cosPe - ddy * sinPe,
+                     pendingEdit.pivotY + ddx * sinPe + ddy * cosPe)
+            } else Pair(pendingEdit.pivotX, pendingEdit.pivotY)
+            if (!peIsLine) {
+                PaddedFrameOverlay(
+                    backdrop = canvasBackdrop,
+                    // 框中心 = pivot（和预览的旋转中心一致）
+                    bounds = Bounds(
+                        peFrameCx - (customHw ?: 50f),
+                        peFrameCy - (customHh ?: 50f),
+                        peFrameCx + (customHw ?: 50f),
+                        peFrameCy + (customHh ?: 50f)
+                    ),
+                    frameRotation = totalFrameRotation,
+                    scaleX = pendingEdit.scaleX,
+                    scaleY = pendingEdit.scaleY,
+                    offsetX = pendingEdit.offsetX,
+                    offsetY = pendingEdit.offsetY,
+                    canvasScale = canvasScale,
+                    canvasOffsetX = canvasOffsetX,
+                    canvasOffsetY = canvasOffsetY,
+                    isMidpointRange = isRange,
+                    hideMidpoints = isTextNum,
+                    customHalfW = customHw,
+                    customHalfH = customHh,
+                    onBodyDrag = onUpdateOffset,
+                    onCornerScale = { r -> onUpdateScale(r, r) },
+                    onCornerRotate = onUpdateRotation,
+                    orthoStep = orthoStep,
+                    onStepRotate = onStepRotatePending,
+                    onMidpointScale = onUpdateScale,
+                    onMidpointOffset = onUpdateOffset,
+                    onArrowSpan = onUpdateArrowSpan,
+                    onRectMidpointDrag = run {
+                        val p = pendingEdit.primitive
+                        when (p) {
+                            is DrawingPrimitive.RectanglePrimitive -> { idx, amount ->
+                                // 锁定版（2026-10-13）：规范化两点索引+带符号半宽，越过对边自然翻转。
+                                // 坐标系与原来一致：待确认旋转在 edit.rotation（worldToScreen 外部施加），
+                                // 存储层只动 p.rotation 坐标系内的量。
+                                peRectDragApply(idx, amount)
                             }
-                        }
-                    }
-            )
-        }
-
-        // Layer 3b: midpoint resize handles (directional)
-        for ((i, m) in finalMidpoints.withIndex()) {
-            val midPosState = rememberUpdatedState(m)
-            val midCenterState = rememberUpdatedState(centerScreen)
-            val midPeState = rememberUpdatedState(pendingEdit)
-            Box(
-                modifier = Modifier
-                    .offset { IntOffset((m.x - handleRadiusPx).toInt(), (m.y - handleRadiusPx).toInt()) }
-                    .size(handleSize).clip(CircleShape)
-                    .pointerInput(Unit) {
-                        detectDragGestures { change, dragAmount ->
-                            change.consume()
-                            val mp = midPosState.value; val cs = midCenterState.value
-                            val pe = midPeState.value
-                            val hx = mp.x - cs.x; val hy = mp.y - cs.y
-                            val dsq = hx * hx + hy * hy
-                            if (dsq > 1f) {
-                                val r = (hx * dragAmount.x + hy * dragAmount.y) / dsq
-                                if (isRange) {
-                                    // 区间数字：两侧中点只调箭头杆长（arrowSpan），不影响整体缩放
-                                    onUpdateArrowSpan(1f + r)
-                                } else {
-                                    val sc = csState.value
-                                    val halfActual = sqrt(dsq) - paddingPx
-                                    when (i) {
-                                        0 -> { // 上中点：拉伸高度，下边不动
-                                            onUpdateScale(1f, 1f + r)
-                                            onUpdateOffset(0f, -halfActual * r / sc)
-                                        }
-                                        1 -> { // 下中点：拉伸高度，上边不动
-                                            onUpdateScale(1f, 1f + r)
-                                            onUpdateOffset(0f, halfActual * r / sc)
-                                        }
-                                        2 -> { // 左中点：拉伸宽度，右边不动
-                                            onUpdateScale(1f + r, 1f)
-                                            onUpdateOffset(-halfActual * r / sc, 0f)
-                                        }
-                                        3 -> { // 右中点：拉伸宽度，左边不动
-                                            onUpdateScale(1f + r, 1f)
-                                            onUpdateOffset(halfActual * r / sc, 0f)
-                                        }
-                                    }
+                            is DrawingPrimitive.CirclePrimitive -> { idx, amount ->
+                                // 圆/椭圆：idx 即 PFO [top,bottom,left,right]，对向顶点固定
+                                val np = p.dragEdge(idx, amount)
+                                onUpdatePrimitive(np)
+                                // 手柄跟随被拖顶点（带符号半径）：拉过圆心时手柄连续穿过、不跳对面
+                                val ci = idx.coerceIn(0, 3)
+                                peRectDragHandle = when (ci) {
+                                    0 -> Offset(np.centerX, np.centerY - np.rawRadiusY)
+                                    1 -> Offset(np.centerX, np.centerY + np.rawRadiusY)
+                                    2 -> Offset(np.centerX - np.rawRadiusX, np.centerY)
+                                    else -> Offset(np.centerX + np.rawRadiusX, np.centerY)
                                 }
                             }
+                            else -> null
+                        }
+                    },
+                    onHandleActiveChanged = onHandleActiveChanged,
+                    dragHandleWorld = peRectDragHandle,
+                )
+            }
+
+            // Primitive preview — 直接读 pendingEdit 参数，重组时 lambda 必然新建触发重绘。
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                if (!pendingEdit.isActive() || pendingEdit.bounds == null) return@Canvas
+                val p = pendingEdit.primitive ?: return@Canvas
+                drawPrimitiveAt(p, pendingEdit, csState2.value, coxState.value, coyState.value,
+                    glsState.value * p.lineScaleFactor, bdState.value, textMeasurePaint)
+            }
+
+            // 直线：两个圆形玻璃端点压在线的两端，各自独立拖动 / 吸附。
+            // 画在预览之上（球压住线端），替代整套框与旋转、缩放、中点手柄。
+            if (peIsLine) {
+                val line = pePrim as? DrawingPrimitive.LinePrimitive
+                if (line != null) {
+                    LineEndpointOverlay(
+                        line = line,
+                        offsetX = pendingEdit.offsetX,
+                        offsetY = pendingEdit.offsetY,
+                        canvasScale = canvasScale,
+                        canvasOffsetX = canvasOffsetX,
+                        canvasOffsetY = canvasOffsetY,
+                        primitives = primitives,
+                        backdrop = canvasBackdrop,
+                        onMoveEndpoint = { isStart, x, y ->
+                            val cur = pendingEdit.primitive as? DrawingPrimitive.LinePrimitive
+                            if (cur != null) {
+                                onUpdatePrimitive(
+                                    if (isStart) cur.copy(startX = x, startY = y)
+                                    else cur.copy(endX = x, endY = y)
+                                )
+                            }
+                        },
+                        onBodyDrag = onUpdateOffset,
+                        onHandleActiveChanged = onHandleActiveChanged
+                    )
+                }
+            }
+
+            // 方向键微调（游戏手柄十字布局）：单击=精准一步、长按=加速连续移动（上限 16×）
+            NudgePad(
+                onNudge = { dx, dy -> onUpdateOffset(dx, dy) },
+                modifier = Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = glassToolbarInset() + 52.dp),   // 与选择模式微调键同高（2026-10-14）
+                backdrop = canvasBackdrop
+            )
+
+            // Confirm / Cancel buttons
+            Row(
+                Modifier.fillMaxWidth().align(Alignment.BottomCenter).padding(bottom = glassToolbarInset() + 64.dp),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                val btnSize = 36.dp
+                // 2026-10-14：取消/确认改为液态玻璃圆键（参照微调键样式）；无玻璃时回退纯色
+                val cancelMod = if (canvasBackdrop != null) {
+                    Modifier.size(btnSize).drawBackdrop(
+                        backdrop = canvasBackdrop,
+                        shape = { CircleShape },
+                        effects = {
+                            vibrancy()
+                            blur(2f.dp.toPx())
+                            lens(12f.dp.toPx(), 24f.dp.toPx())
+                        },
+                        onDrawSurface = { drawRect(Color(0x0AFFFFFF)) }
+                    )
+                } else Modifier.size(btnSize).clip(CircleShape).background(Color(0xFF757575))
+                Box(cancelMod.clickable { onCancel() }, contentAlignment = Alignment.Center) {
+                    Icon(Icons.Default.Close, "取消", modifier = Modifier.size(18.dp),
+                        tint = if (canvasBackdrop != null) Color(0xFFD32F2F) else Color.White)
+                }
+                Spacer(Modifier.width(12.dp))
+                val confirmMod = if (canvasBackdrop != null) {
+                    Modifier.size(btnSize).drawBackdrop(
+                        backdrop = canvasBackdrop,
+                        shape = { CircleShape },
+                        effects = {
+                            vibrancy()
+                            blur(2f.dp.toPx())
+                            lens(12f.dp.toPx(), 24f.dp.toPx())
+                        },
+                        onDrawSurface = { drawRect(Color(0x0AFFFFFF)) }
+                    )
+                } else Modifier.size(btnSize).clip(CircleShape).background(Color(0xFF4CAF50))
+                Box(confirmMod.clickable { onConfirm() }, contentAlignment = Alignment.Center) {
+                    Icon(Icons.Default.Check, "确认", modifier = Modifier.size(18.dp),
+                        tint = if (canvasBackdrop != null) Color(0xFF2E7D32) else Color.White)
+                }
+            }
+        } else if (showSelection) {
+            // ── Selection mode (transform handles only) ──
+            // bounds 缺失时按选中图形现算（含 BlockRef 按块内容），防止固定到原点的默认框
+            val selBoundsFallback = if (selection.bounds == null && selection.initialBounds == null) {
+                var acc: FloatArray? = null
+                for (i in selection.selectedIndices) {
+                    val p = primitives.getOrNull(i) ?: continue
+                    val b = pfoWorldBounds(p, blockDefs, textMeasurePaint) ?: continue
+                    acc = if (acc == null) b.copyOf() else floatArrayOf(
+                        minOf(acc!![0], b[0]), minOf(acc!![1], b[1]),
+                        maxOf(acc!![2], b[2]), maxOf(acc!![3], b[3])
+                    )
+                }
+                acc?.let { Bounds(it[0], it[1], it[2], it[3]) }
+            } else null
+            val bbox = selection.bounds ?: selection.initialBounds ?: selBoundsFallback ?: Bounds(0f, 0f, 100f, 100f)
+            val selPivotSrc = selection.initialBounds ?: selection.bounds ?: selBoundsFallback
+            // 单选直线：与画线待确认同一套界面（两个端点球），不出框、不出旋转/缩放手柄
+            val singleLineIdx = selection.selectedIndices.singleOrNull()
+                ?.takeIf { primitives.getOrNull(it) is DrawingPrimitive.LinePrimitive }
+            if (singleLineIdx == null) {
+            // For single selection, compute tight half-dimensions matching the primitive's intrinsic size.
+            // This avoids the double-rotation conflict between computeBounds (returns AABB) and PFO rotation.
+            val selCustomPair = if (selection.selectedIndices.size == 1) {
+                val idx = selection.selectedIndices.first()
+                val p = primitives.getOrNull(idx)
+                p?.let { computePrimitiveHalfDims(it, selection.selScaleX, selection.selScaleY, globalLineScale, canvasScale, minHalf, textMeasurePaint, blockDefs) }
+            } else null
+            // 选择模式 pivot：用初始 bounds 中心（不随拖拽漂移）
+            val selPivotX = selPivotSrc?.let { (it.minX + it.maxX) / 2f } ?: 0f
+            val selPivotY = selPivotSrc?.let { (it.minY + it.maxY) / 2f } ?: 0f
+            // 多选（或无紧致半尺寸的类型如手绘）时，框半尺寸用并集 bounds，保证包裹所有图形
+            val selHalfW = selCustomPair?.first ?: ((bbox.maxX - bbox.minX) / 2f)
+            val selHalfH = selCustomPair?.second ?: ((bbox.maxY - bbox.minY) / 2f)
+            PaddedFrameOverlay(
+                backdrop = canvasBackdrop,
+                // 框中心 = pivot（和待确认模式同一套）
+                bounds = Bounds(
+                    selPivotX - selHalfW,
+                    selPivotY - selHalfH,
+                    selPivotX + selHalfW,
+                    selPivotY + selHalfH
+                ),
+                frameRotation = selection.rotation,
+                scaleX = selection.selScaleX,
+                scaleY = selection.selScaleY,
+                offsetX = selection.selOffsetX,
+                offsetY = selection.selOffsetY,
+                canvasScale = canvasScale,
+                canvasOffsetX = canvasOffsetX,
+                canvasOffsetY = canvasOffsetY,
+                hideMidpoints = selection.hideMidpoints || selection.selectedIndices.size > 1,
+                customHalfW = selCustomPair?.first,
+                customHalfH = selCustomPair?.second,
+                onBodyDrag = onMoveSelected,
+                onCornerScale = { r -> onScaleSelected(r, r) },
+                onCornerRotate = { r -> onRotateSelected(r) },
+                orthoStep = orthoStep,
+                onStepRotate = onStepRotateSelected,
+                onMidpointScale = onScaleSelected,
+                onMidpointOffset = onMoveSelected,
+                // 只有矩形/圆走专用拖拽通道（单选直线已走上方的端点球分支）；
+                // 其他类型（手绘等）必须回退到通用缩放，否则通道对所有类型非空会把通用缩放吃掉
+                onRectMidpointDrag = run {
+                    val single = selection.selectedIndices.singleOrNull()?.let { primitives.getOrNull(it) }
+                    if (single is DrawingPrimitive.RectanglePrimitive ||
+                        single is DrawingPrimitive.CirclePrimitive) onRectMidpointDrag else null
+                },
+                onTransformEnd = onTransformEnd,
+                onHandleActiveChanged = onHandleActiveChanged,
+                dragHandleWorld = rectDragHandleWorld,
+            )
+            } else {
+                // 单选直线：两个端点球（与画线待确认同一套界面）。
+                // 拖端点改长度/角度，拖线身整体平移；松手统一走 onSelectionDragEnd 收尾落盘。
+                val line = primitives[singleLineIdx] as DrawingPrimitive.LinePrimitive
+                LineEndpointOverlay(
+                    line = line,
+                    offsetX = selection.selOffsetX,
+                    offsetY = selection.selOffsetY,
+                    canvasScale = canvasScale,
+                    canvasOffsetX = canvasOffsetX,
+                    canvasOffsetY = canvasOffsetY,
+                    primitives = primitives,
+                    excludeIndex = singleLineIdx,
+                    backdrop = canvasBackdrop,
+                    onMoveEndpoint = { isStart, x, y -> onMoveSelectedLineEndpoint(isStart, x, y) },
+                    onBodyDrag = onMoveSelected,
+                    onHandleActiveChanged = { active ->
+                        onHandleActiveChanged(active)
+                        if (!active) onSelectionDragEnd()
+                    }
+                )
+            }
+
+            // Render selected primitives with transform params (when transforming)
+            val sel = selState.value
+            if (sel != null && sel.isTransforming && sel.selectedIndices.isNotEmpty()) {
+                val transformEdit = PendingEdit(
+                    active = true,
+                    rotation = sel.rotation - sel.startRotation,
+                    scaleX = if (sel.startScaleX != 0f) sel.selScaleX / sel.startScaleX else 1f,
+                    scaleY = if (sel.startScaleY != 0f) sel.selScaleY / sel.startScaleY else 1f,
+                    offsetX = sel.selOffsetX - sel.startX,
+                    offsetY = sel.selOffsetY - sel.startY,
+                    bounds = sel.bounds,
+                    // 旋转中心用 initialBounds（变换开始时记录，不随 midpoint 漂移）
+                    pivotX = (sel.initialBounds ?: sel.bounds)?.let { (it.minX + it.maxX) / 2f } ?: 0f,
+                    pivotY = (sel.initialBounds ?: sel.bounds)?.let { (it.minY + it.maxY) / 2f } ?: 0f
+                )
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    // 选中光晕：紧贴元素的淡蓝色辉光（多趟加宽描边），画在变换预览之下
+                    for (idx in sel.selectedIndices) {
+                        if (idx >= primitives.size) continue
+                        val p = primitives[idx]
+                        for ((inflatePx, glowAlpha) in SELECTION_GLOW_PASSES) {
+                            drawPrimitiveAt(p, transformEdit, csState2.value, coxState.value, coyState.value,
+                                glsState.value * p.lineScaleFactor, bdState.value, textMeasurePaint,
+                                glowInflatePx = inflatePx, glowColor = SELECTION_GLOW_COLOR.copy(alpha = glowAlpha))
                         }
                     }
-            )
-        }
-
-        // Layer 4: confirm/cancel buttons above floating status bar
-        Row(
-            Modifier.fillMaxWidth().align(Alignment.BottomCenter).padding(bottom = 64.dp),
-            horizontalArrangement = Arrangement.Center,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            // 确认取消按钮统一大小
-            val btnSize = 36.dp
-            val capsuleShape = RoundedCornerShape(btnSize / 2)
-            FloatingActionButton(onClick = onCancel,
-                modifier = Modifier.size(btnSize),
-                containerColor = Color(0xFF757575), contentColor = Color.White, shape = capsuleShape) {
-                Icon(Icons.Default.Close, "取消", modifier = Modifier.size(18.dp))
-            }
-            Spacer(Modifier.width(12.dp))
-            FloatingActionButton(onClick = onConfirm,
-                modifier = Modifier.size(btnSize),
-                containerColor = Color(0xFF4CAF50), contentColor = Color.White, shape = capsuleShape) {
-                Icon(Icons.Default.Check, "确认", modifier = Modifier.size(18.dp))
+                    for (idx in sel.selectedIndices) {
+                        if (idx >= primitives.size) continue
+                        val p = primitives[idx]
+                        drawPrimitiveAt(p, transformEdit, csState2.value, coxState.value, coyState.value,
+                            glsState.value * p.lineScaleFactor, bdState.value, textMeasurePaint)
+                    }
+                }
             }
         }
     }
 }
 
-/**
- * Draw a primitive with pending edit transforms applied (preview overlay).
- */
+// ═══════════════════════════════════════════════════════════
+//  Primitive preview drawing
+// ═══════════════════════════════════════════════════════════
+
 private fun DrawScope.drawPrimitiveAt(
     primitive: DrawingPrimitive, edit: PendingEdit, canvasScale: Float, canvasOffsetX: Float, canvasOffsetY: Float,
     strokeScale: Float = 1f,
-    blockDefs: List<BlockDef> = emptyList()
+    blockDefs: List<BlockDef> = emptyList(),
+    reusablePaint: Paint? = null,
+    // 光晕趟（选中高亮）：非 null 时本趟只画淡蓝色辉光，笔画/字形按 glowInflatePx（屏幕 px 单边）加宽
+    glowInflatePx: Float? = null,
+    glowColor: Color = SELECTION_GLOW_COLOR
 ) {
     val ox = edit.offsetX; val oy = edit.offsetY
     val sx = edit.scaleX; val sy = edit.scaleY
     val cosR = cos(edit.rotation); val sinR = sin(edit.rotation)
-    val alpha = 0.7f
-    val bounds = edit.bounds
-    val cx0 = bounds?.let { (it.minX + it.maxX) / 2f } ?: 0f
-    val cy0 = bounds?.let { (it.minY + it.maxY) / 2f } ?: 0f
-    val newCx = cx0 + ox; val newCy = cy0 + oy
-    fun transform(wx: Float, wy: Float): Offset {
-        var x = (wx - cx0) * sx; var y = (wy - cy0) * sy
-        val rx = x * cosR - y * sinR + newCx; val ry = x * sinR + y * cosR + newCy
+    val alpha = 1f
+    // 旋转中心用 pivot（固定轴），确保没动的角点不漂移
+    val cx0 = edit.pivotX
+    val cy0 = edit.pivotY
+    val avgScale = sqrt(abs(sx * sy))
+    val glow = glowInflatePx != null
+    val gInf = glowInflatePx ?: 0f
+    val strokeColor = if (glow) glowColor else primitive.color.copy(alpha = alpha)
+
+    fun worldToScreen(x: Float, y: Float): Offset {
+        val lx = (x - cx0) * sx; val ly = (y - cy0) * sy
+        val rx = lx * cosR - ly * sinR + cx0 + ox
+        val ry = lx * sinR + ly * cosR + cy0 + oy
         return Offset(rx * canvasScale + canvasOffsetX, ry * canvasScale + canvasOffsetY)
     }
+
+    fun lineWSP(x1: Float, y1: Float, x2: Float, y2: Float, color: Color, sw: Float, cap: StrokeCap = StrokeCap.Round) {
+        val p1 = worldToScreen(x1, y1); val p2 = worldToScreen(x2, y2)
+        drawLine(color, p1, p2, sw, cap)
+    }
+
     when (primitive) {
         is DrawingPrimitive.FreehandPath -> {
-            if (primitive.points.size < 2) return
-            val path = Path().apply {
-                var first = true
-                for (pt in primitive.points) {
-                    val tp = transform(pt.x, pt.y)
-                    if (first) { moveTo(tp.x, tp.y); first = false }
-                    else lineTo(tp.x, tp.y)
+            if (primitive.points.size >= 2) {
+                val screenPts = primitive.points.map { worldToScreen(it.x, it.y) }
+                val modelPts = screenPts.map { Point2D(it.x, it.y) }
+                val path = smoothPathFromPoints(modelPts, primitive.isClosed, primitive.sharpCorners)
+                if (glow) {
+                    val w = maxOf(primitive.strokeWidth * strokeScale * canvasScale, 1.5f * canvasScale) + 2f * gInf
+                    drawPath(path, glowColor, style = Stroke(w, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                } else {
+                    drawPathWithStyle(
+                        path = path,
+                        color = primitive.color.copy(alpha = alpha),
+                        strokeWidth = primitive.strokeWidth,
+                        lineStyle = primitive.lineStyle,
+                        strokeScale = strokeScale * canvasScale,
+                        minWidth = 1.5f * canvasScale
+                    )
+                    if (primitive.lineStyle.type == LineType.LIGHTNING && primitive.points.size >= 2) {
+                        drawLightningOnPolyline(modelPts, primitive.isClosed, primitive.color.copy(alpha = alpha), strokeScale * canvasScale)
+                    }
                 }
-                if (primitive.isClosed) close()
             }
-            drawPathWithStyle(path, primitive.color.copy(alpha = alpha),
-                primitive.strokeWidth, primitive.lineStyle, canvasScale * strokeScale)
         }
         is DrawingPrimitive.RectanglePrimitive -> {
-            // First handle intrinsic rotation if any
-            val hw = abs(primitive.endX - primitive.startX) / 2f
-            val hh = abs(primitive.endY - primitive.startY) / 2f
-            val rcX = minOf(primitive.startX, primitive.endX) + hw
-            val rcY = minOf(primitive.startY, primitive.endY) + hh
-            val cosP = kotlin.math.cos(primitive.rotation)
-            val sinP = kotlin.math.sin(primitive.rotation)
-            // 4 local corners (relative to rect center), rotated by intrinsic rotation
-            val localCorners = listOf(
-                rcX + (-hw) * cosP - (-hh) * sinP to rcY + (-hw) * sinP + (-hh) * cosP,
-                rcX + ( hw) * cosP - (-hh) * sinP to rcY + ( hw) * sinP + (-hh) * cosP,
-                rcX + ( hw) * cosP - ( hh) * sinP to rcY + ( hw) * sinP + ( hh) * cosP,
-                rcX + (-hw) * cosP - ( hh) * sinP to rcY + (-hw) * sinP + ( hh) * cosP,
-            )
-            val corners = localCorners.map { (wx, wy) -> transform(wx, wy) }
-            val rectPath = Path().apply {
-                moveTo(corners[0].x, corners[0].y)
-                for (i in 1..3) lineTo(corners[i].x, corners[i].y)
+            val cxRect = (primitive.corners.map { it.x }.let { (it.min() + it.max()) / 2f })
+            val cyRect = (primitive.corners.map { it.y }.let { (it.min() + it.max()) / 2f })
+            val hw = abs(primitive.corners[1].x - primitive.corners[0].x) / 2f
+            val hh = abs(primitive.corners[3].y - primitive.corners[0].y) / 2f
+            val totalRot = primitive.rotation  // edit.rotation already in worldToScreen
+            // 屏幕坐标四角（虚线/闪电都基于这份角点，保证与路径完全贴合）
+            val cornersScreen: List<Offset> = if (kotlin.math.abs(totalRot) < 0.001f) {
+                listOf(
+                    worldToScreen(primitive.corners[0].x, primitive.corners[0].y),
+                    worldToScreen(primitive.corners[1].x, primitive.corners[1].y),
+                    worldToScreen(primitive.corners[2].x, primitive.corners[2].y),
+                    worldToScreen(primitive.corners[3].x, primitive.corners[3].y)
+                )
+            } else {
+                val cosR = cos(totalRot); val sinR = sin(totalRot)
+                val eCosR = cos(edit.rotation); val eSinR = sin(edit.rotation)
+                fun corner(wx: Float, wy: Float): Offset {
+                    // Step 1: rotate axis-aligned corner by primitive.rotation around rect center
+                    val dx = wx - cxRect; val dy = wy - cyRect
+                    val rpx = cxRect + dx * cosR - dy * sinR
+                    val rpy = cyRect + dx * sinR + dy * cosR
+                    // Step 2: pass through worldToScreen (scale → edit.rotation → offset)
+                    val lx = (rpx - cx0) * sx; val ly = (rpy - cy0) * sy
+                    val rx = lx * eCosR - ly * eSinR + cx0 + ox
+                    val ry = lx * eSinR + ly * eCosR + cy0 + oy
+                    return Offset(rx * canvasScale + canvasOffsetX, ry * canvasScale + canvasOffsetY)
+                }
+                listOf(corner(cxRect - hw, cyRect - hh), corner(cxRect + hw, cyRect - hh),
+                    corner(cxRect + hw, cyRect + hh), corner(cxRect - hw, cyRect + hh))
+            }
+            val path = Path().apply {
+                moveTo(cornersScreen[0].x, cornersScreen[0].y)
+                lineTo(cornersScreen[1].x, cornersScreen[1].y)
+                lineTo(cornersScreen[2].x, cornersScreen[2].y)
+                lineTo(cornersScreen[3].x, cornersScreen[3].y)
                 close()
             }
-            drawPathWithStyle(rectPath, primitive.color.copy(alpha = alpha),
-                primitive.strokeWidth, primitive.lineStyle, canvasScale * strokeScale)
-            if (primitive.lineStyle.type == LineType.LIGHTNING) {
-                val edges = listOf(0 to 1, 1 to 2, 2 to 3, 3 to 0)
-                for ((ei, ej) in edges) {
-                    val a = corners[ei]; val b = corners[ej]
-                    val lx = b.x - a.x; val ly = b.y - a.y
-                    val len = sqrt(lx * lx + ly * ly)
-                    if (len < 1f) continue
-                    val n = maxOf(2, (len / 60f).toInt())
-                    for (k in 1..n) {
-                        val t = k.toFloat() / (n + 1)
-                        val px = a.x + t * lx; val py = a.y + t * ly
-                        val sz = 16f * canvasScale * strokeScale
-                        drawLine(primitive.color.copy(alpha = alpha), Offset(px - sz, py - sz), Offset(px + sz, py + sz), strokeWidth = 1.5f * canvasScale)
-                        drawLine(primitive.color.copy(alpha = alpha), Offset(px + sz, py - sz), Offset(px - sz, py + sz), strokeWidth = 1.5f * canvasScale)
+            val sw = maxOf(primitive.strokeWidth * strokeScale * canvasScale, 1.5f * canvasScale)
+            if (glow) {
+                // 光晕趟：连续描边即可（不做虚线/闪电效果）
+                drawPath(path, strokeColor, style = Stroke(sw + 2f * gInf, cap = StrokeCap.Round, join = StrokeJoin.Round))
+            } else {
+                // 与画布渲染同源：strokeWidth 传世界单位，缩放交给 strokeScale（内部只乘一次 canvasScale）
+                drawPathWithStyle(
+                    path = path,
+                    color = primitive.color.copy(alpha = alpha),
+                    strokeWidth = primitive.strokeWidth,
+                    lineStyle = primitive.lineStyle,
+                    strokeScale = strokeScale * canvasScale,
+                    minWidth = 1.5f * canvasScale
+                )
+                if (primitive.lineStyle.type == LineType.LIGHTNING) {
+                    val xs = strokeScale * canvasScale
+                    for (i in 0 until 4) {
+                        drawLightningXMarks(cornersScreen[i], cornersScreen[(i + 1) % 4],
+                            primitive.color.copy(alpha = alpha), xs)
                     }
                 }
             }
         }
         is DrawingPrimitive.CirclePrimitive -> {
-            val origRx = abs(primitive.endX - primitive.centerX)
-            val origRy = abs(primitive.endY - primitive.centerY)
+            // worldToScreen rotates the center around the bounds center (needed for multi-select).
+            // 椭圆自身旋转（primitive.rotation + edit.rotation）由采样路径承担。
+            val c = worldToScreen(primitive.centerX, primitive.centerY)
+            val drawRx = primitive.radiusX * abs(sx) * canvasScale
+            val drawRy = primitive.radiusY * abs(sy) * canvasScale
+            val totalRot = primitive.rotation + edit.rotation  // full rotation around own center
+            val cosT = cos(totalRot); val sinT = sin(totalRot)
+            val sw = maxOf(primitive.strokeWidth * strokeScale * canvasScale, 1.5f * canvasScale)
+            // 统一采样成折线路径：addOval 无法带旋转，而虚线(PathEffect)与闪电(X 标记)
+            // 都需要“沿路径度量”的语义，采样后才能与画布最终渲染一致
+            val steps = 96
             val path = Path().apply {
-                val segs = 32
-                for (i in 0..segs) { val a = (i.toFloat() / segs) * 2f * kotlin.math.PI.toFloat()
-                    val pt = transform(primitive.centerX + origRx * cos(a), primitive.centerY + origRy * sin(a))
-                    if (i == 0) moveTo(pt.x, pt.y) else lineTo(pt.x, pt.y) }
+                for (i in 0..steps) {
+                    val a = (i.toFloat() / steps) * 2f * kotlin.math.PI.toFloat()
+                    val lx = drawRx * cos(a); val ly = drawRy * sin(a)
+                    val px = c.x + lx * cosT - ly * sinT
+                    val py = c.y + lx * sinT + ly * cosT
+                    if (i == 0) moveTo(px, py) else lineTo(px, py)
+                }
                 close()
             }
-            drawPathWithStyle(path, primitive.color.copy(alpha = alpha),
-                primitive.strokeWidth, primitive.lineStyle, canvasScale * strokeScale)
-            if (primitive.lineStyle.type == LineType.LIGHTNING) {
-                val segs = 16
-                val avgScale = sqrt(abs(edit.scaleX * edit.scaleY))
-                val r2x = origRx * avgScale; val r2y = origRy * avgScale
-                for (i in 0 until segs) {
-                    val a1 = (i.toFloat() / segs) * 2f * kotlin.math.PI.toFloat()
-                    val a2 = ((i + 1).toFloat() / segs) * 2f * kotlin.math.PI.toFloat()
-                    val mid = (a1 + a2) / 2f
-                    val mx = transform(primitive.centerX + origRx * cos(mid), primitive.centerY + origRy * sin(mid))
-                    val sz = 16f * canvasScale * strokeScale
-                    drawLine(primitive.color.copy(alpha = alpha), Offset(mx.x - sz, mx.y - sz), Offset(mx.x + sz, mx.y + sz), strokeWidth = 1.5f * canvasScale)
-                    drawLine(primitive.color.copy(alpha = alpha), Offset(mx.x + sz, mx.y - sz), Offset(mx.x - sz, mx.y + sz), strokeWidth = 1.5f * canvasScale)
+            if (glow) {
+                // 光晕趟：连续描边即可（不做虚线/闪电效果）
+                drawPath(path, strokeColor, style = Stroke(sw + 2f * gInf, cap = StrokeCap.Round, join = StrokeJoin.Round))
+            } else {
+                drawPathWithStyle(
+                    path = path,
+                    color = primitive.color.copy(alpha = alpha),
+                    strokeWidth = primitive.strokeWidth,
+                    lineStyle = primitive.lineStyle,
+                    strokeScale = strokeScale * canvasScale,
+                    minWidth = 1.5f * canvasScale
+                )
+                if (primitive.lineStyle.type == LineType.LIGHTNING) {
+                    // 与 DrawingCanvas.drawCirclePrimitive 同源：按周长等分，最少 8 个 X
+                    val circumference = kotlin.math.PI.toFloat() *
+                        (3f * (drawRx + drawRy) - sqrt((3f * drawRx + drawRy) * (drawRx + 3f * drawRy)))
+                    val count = maxOf(8, (circumference / 120f).toInt())
+                    val xs = strokeScale * canvasScale
+                    for (i in 0 until count) {
+                        val angle = (i.toFloat() / count) * 2f * kotlin.math.PI.toFloat()
+                        val lx = drawRx * cos(angle); val ly = drawRy * sin(angle)
+                        val px = c.x + lx * cosT - ly * sinT
+                        val py = c.y + lx * sinT + ly * cosT
+                        val ltx = -drawRx * sin(angle); val lty = drawRy * cos(angle)
+                        val tx2 = ltx * cosT - lty * sinT; val ty2 = ltx * sinT + lty * cosT
+                        drawXMarkOnSegment(Offset(px, py), Offset(tx2, ty2), primitive.color.copy(alpha = alpha), xs)
+                    }
                 }
             }
         }
         is DrawingPrimitive.LinePrimitive -> {
-            val s = transform(primitive.startX, primitive.startY); val e = transform(primitive.endX, primitive.endY)
-            drawLine(primitive.color.copy(alpha = alpha), s, e, strokeWidth = primitive.strokeWidth * canvasScale * strokeScale, cap = StrokeCap.Round)
-            if (primitive.lineStyle.type == LineType.LIGHTNING) {
-                val dx = e.x - s.x; val dy = e.y - s.y
-                val len = sqrt(dx * dx + dy * dy)
-                if (len > 1f) {
-                    val n = maxOf(2, (len / 60f).toInt())
-                    for (k in 1..n) {
-                        val t = k.toFloat() / (n + 1)
-                        val px = s.x + t * dx; val py = s.y + t * dy
-                        val sz = 16f * canvasScale * strokeScale
-                        drawLine(primitive.color.copy(alpha = alpha), Offset(px - sz, py - sz), Offset(px + sz, py + sz), strokeWidth = 1.5f * canvasScale)
-                        drawLine(primitive.color.copy(alpha = alpha), Offset(px + sz, py - sz), Offset(px - sz, py + sz), strokeWidth = 1.5f * canvasScale)
-                    }
+            val sw = maxOf(primitive.strokeWidth * strokeScale * canvasScale, 1.5f * canvasScale)
+            if (glow) {
+                // 光晕趟：连续描边即可（不做虚线/闪电效果）
+                lineWSP(primitive.startX, primitive.startY, primitive.endX, primitive.endY,
+                    strokeColor, sw + 2f * gInf)
+            } else if (primitive.lineStyle.type == LineType.SOLID) {
+                lineWSP(primitive.startX, primitive.startY, primitive.endX, primitive.endY,
+                    primitive.color.copy(alpha = alpha), sw)
+            } else {
+                val sp = worldToScreen(primitive.startX, primitive.startY)
+                val ep = worldToScreen(primitive.endX, primitive.endY)
+                val path = Path().apply { moveTo(sp.x, sp.y); lineTo(ep.x, ep.y) }
+                // strokeWidth 必须传世界单位：drawPathWithStyle 内部会再乘一次 strokeScale（已含 canvasScale）。
+                // 传屏幕 px 会被二次放大，粗笔 + 圆头端点会把短 dash 之间的空隙填满 → 预览看着像实线。
+                drawPathWithStyle(
+                    path = path,
+                    color = primitive.color.copy(alpha = alpha),
+                    strokeWidth = primitive.strokeWidth,
+                    lineStyle = primitive.lineStyle,
+                    strokeScale = strokeScale * canvasScale,
+                    minWidth = 1.5f * canvasScale
+                )
+                if (primitive.lineStyle.type == LineType.LIGHTNING) {
+                    // X 标记必须用屏幕坐标（此前传的是世界坐标，标记被画到别处，只剩一条实线）
+                    drawLightningXMarks(sp, ep, primitive.color.copy(alpha = alpha), strokeScale * canvasScale)
                 }
             }
         }
-        is DrawingPrimitive.NumberLabelPrimitive -> {
-            val pt = transform(primitive.x, primitive.y)
-            val text = primitive.value.toString()
-            val totalRotation = edit.rotation + primitive.rotation
-            val avgScale = sqrt(abs(edit.scaleX * edit.scaleY))
-            val lineScale = strokeScale
-            val effectiveFontSize = (primitive.fontSize * avgScale).coerceIn(30f, 600f)
-            val fs = effectiveFontSize * lineScale * canvasScale * 1.3f
-            val p = Paint().apply {
-                color = primitive.color.copy(alpha = alpha).hashCode()
-                textSize = fs
-                isAntiAlias = true; textAlign = Paint.Align.CENTER
-            }
-            val nc = drawContext.canvas.nativeCanvas
-            if (kotlin.math.abs(totalRotation) > 0.001f) {
-                nc.save()
-                nc.rotate(totalRotation * 180f / kotlin.math.PI.toFloat(), pt.x, pt.y)
-                nc.drawText(text, pt.x, pt.y + fs * 0.3f, p)
-                nc.restore()
-            } else {
-                nc.drawText(text, pt.x, pt.y + fs * 0.3f, p)
-            }
-        }
         is DrawingPrimitive.TextPrimitive -> {
-            val pt = transform(primitive.x, primitive.y)
-            val totalRotation = edit.rotation + primitive.rotation
-            val avgScale = sqrt(abs(edit.scaleX * edit.scaleY))
-            val lineScale = strokeScale
-            val effectiveFontSize = (primitive.fontSize * avgScale).coerceIn(30f, 600f)
-            val fs = effectiveFontSize * lineScale * canvasScale
-            val p = Paint().apply {
-                color = primitive.color.copy(alpha = alpha).hashCode()
-                textSize = fs * 1.3f
-                isAntiAlias = true; textAlign = Paint.Align.CENTER
+            val sc = worldToScreen(primitive.x, primitive.y)
+            val drawX = sc.x; val drawY = sc.y
+            val paint = reusablePaint ?: Paint().apply {
+                color = strokeColor.toArgb()
+                textSize = primitive.fontSize * 1.3f * canvasScale * avgScale
+                typeface = Typeface.DEFAULT_BOLD; isAntiAlias = true; textAlign = Paint.Align.CENTER
             }
+            if (reusablePaint != null) {
+                paint.color = strokeColor.toArgb()
+                paint.textSize = primitive.fontSize * 1.3f * canvasScale * avgScale
+            }
+            // 光晕趟：字形轮廓加粗（本体随后画在上层，只露一圈淡蓝边）；显式复位避免污染复用 paint
+            paint.style = if (glow) Paint.Style.FILL_AND_STROKE else Paint.Style.FILL
+            paint.strokeWidth = if (glow) 2f * gInf else 0f
             val nc = drawContext.canvas.nativeCanvas
-            val text = primitive.text
-            if (text.isBlank()) return@drawPrimitiveAt
-            if (kotlin.math.abs(totalRotation) > 0.001f) {
-                nc.save()
-                nc.rotate(totalRotation * 180f / kotlin.math.PI.toFloat(), pt.x, pt.y)
-                nc.drawText(text, pt.x, pt.y + fs * 0.3f, p)
-                nc.restore()
+            // 与 DrawingCanvas 一致：按字体度量垂直居中，避免预览/确认位置偏移
+            val yOff = -(paint.ascent() + paint.descent()) / 2f
+            val totalRot = primitive.rotation + edit.rotation  // text must rotate around own center
+            if (kotlin.math.abs(totalRot) < 0.01f) {
+                nc.drawText(primitive.text, drawX, drawY + yOff, paint)
             } else {
-                nc.drawText(text, pt.x, pt.y + fs * 0.3f, p)
+                nc.save()
+                nc.rotate(totalRot * 180f / kotlin.math.PI.toFloat(), drawX, drawY)
+                nc.drawText(primitive.text, drawX, drawY + yOff, paint)
+                nc.restore()
             }
         }
-        is DrawingPrimitive.RangeLabelPrimitive -> {
-            val pt = transform(primitive.x, primitive.y)
-            val avgScale = sqrt(abs(edit.scaleX * edit.scaleY))
-            val isUniform = abs(edit.scaleX - edit.scaleY) < 0.01f
-            val lineScale = strokeScale
-            // 字号上限与 applyTransform 一致，确保预览和确认后一致
-            val effectiveFontSize = if (isUniform) (primitive.fontSize * avgScale).coerceIn(20f, 600f) else primitive.fontSize
-            val fs = effectiveFontSize * lineScale * canvasScale
-            val totalRotation = edit.rotation + primitive.rotation
-            val p = Paint().apply {
-                color = primitive.color.copy(alpha = alpha).hashCode()
-                textSize = fs
-                isAntiAlias = true; textAlign = Paint.Align.CENTER
+        is DrawingPrimitive.NumberLabelPrimitive -> {
+            val sc = worldToScreen(primitive.x, primitive.y)
+            val drawX = sc.x; val drawY = sc.y
+            val paint = reusablePaint ?: Paint().apply {
+                color = strokeColor.toArgb()
+                textSize = primitive.fontSize * 1.3f * canvasScale * avgScale
+                typeface = Typeface.DEFAULT_BOLD; isAntiAlias = true; textAlign = Paint.Align.CENTER
             }
+            if (reusablePaint != null) {
+                paint.color = strokeColor.toArgb()
+                paint.textSize = primitive.fontSize * 1.3f * canvasScale * avgScale
+            }
+            // 光晕趟：字形轮廓加粗（本体随后画在上层，只露一圈淡蓝边）；显式复位避免污染复用 paint
+            paint.style = if (glow) Paint.Style.FILL_AND_STROKE else Paint.Style.FILL
+            paint.strokeWidth = if (glow) 2f * gInf else 0f
             val nc = drawContext.canvas.nativeCanvas
-            val label1 = primitive.startValue.toString()
-            val label2 = primitive.endValue.toString()
-            val gap = fs * 1.0f
-            // 箭头杆长与字号保持比例（与 applyTransform 一致）
-            val effectiveArrowSpan = primitive.arrowSpan * (effectiveFontSize / primitive.fontSize)
-            val arrowLen = maxOf((effectiveArrowSpan * 80f * lineScale * canvasScale), 20f)
-
-            if (kotlin.math.abs(totalRotation) < 0.001f) {
-                drawPreviewLabelContent(nc, p, label1, label2, pt.x, pt.y, fs, arrowLen, gap, primitive, alpha, canvasScale, lineScale)
+            val yOff = primitive.fontSize * 0.4f * canvasScale * avgScale
+            val totalRot = primitive.rotation + edit.rotation  // text must rotate around own center
+            if (primitive.circled) {
+                // 外圈：圆心对齐文字视觉中心（与 DrawingCanvas.drawNumberLabel 一致）
+                val textWidth = paint.measureText(primitive.value.toString())
+                val fsScaled = primitive.fontSize * canvasScale * avgScale
+                val radius = maxOf(textWidth / 2f, fsScaled * 0.65f) * 1.15f
+                val cy0 = drawY - fsScaled * 0.055f
+                val circlePaint = Paint().apply {
+                    color = strokeColor.toArgb()
+                    style = Paint.Style.STROKE
+                    strokeWidth = maxOf(primitive.strokeWidth * strokeScale * canvasScale, 1.5f * canvasScale) + 2f * gInf
+                    isAntiAlias = true
+                }
+                if (kotlin.math.abs(totalRot) < 0.01f) {
+                    nc.drawCircle(drawX, cy0, radius, circlePaint)
+                } else {
+                    nc.save()
+                    nc.rotate(totalRot * 180f / kotlin.math.PI.toFloat(), drawX, drawY)
+                    nc.drawCircle(drawX, cy0, radius, circlePaint)
+                    nc.restore()
+                }
+            }
+            if (kotlin.math.abs(totalRot) < 0.01f) {
+                nc.drawText(primitive.value.toString(), drawX, drawY + yOff, paint)
             } else {
                 nc.save()
-                nc.rotate(totalRotation * 180f / kotlin.math.PI.toFloat(), pt.x, pt.y)
-                drawPreviewLabelContent(nc, p, label1, label2, pt.x, pt.y, fs, arrowLen, gap, primitive, alpha, canvasScale, lineScale)
+                nc.rotate(totalRot * 180f / kotlin.math.PI.toFloat(), drawX, drawY)
+                nc.drawText(primitive.value.toString(), drawX, drawY + yOff, paint)
                 nc.restore()
             }
         }
         is DrawingPrimitive.BlockRefPrimitive -> {
+            // 预览与画布走同一条渲染路径（BlockRender 唯一入口）：
+            //   锚定 = 内容形心落锚点；块内图元 = drawPrimitive；光晕 = drawSelectionGlowPass。
+            // 此前这里另有一套 drawBlockPrimitive，旋转/区间标注/嵌套块/尖角/线宽比例在预览里全部缺失。
             val bd = blockDefs.find { it.id == primitive.blockDefId }
+            val sc = worldToScreen(primitive.x, primitive.y)
+            // 屏幕系标量缩放：块自身 scale × PFO 等比缩放 × 画布缩放
+            val s = primitive.scale * avgScale * canvasScale
+            val totalRot = primitive.rotation + edit.rotation
+            val contentStrokeScale = blockContentStrokeScale(strokeScale, primitive.scale * avgScale)
+            // 线宽下限系数：1/块缩放（不含 canvasScale——线宽公式里 canvasScale 是显式乘的）
+            val blockFloor = 1f / abs(primitive.scale * avgScale).coerceAtLeast(1e-4f)
             if (bd != null && bd.primitives.isNotEmpty()) {
-                // Compute centroid of block content
-                var cx = 0f; var cy = 0f; var count = 0
-                for (p in bd.primitives) {
-                    val b = when (p) {
-                        is DrawingPrimitive.FreehandPath -> {
-                            if (p.points.size < 2) null
-                            else { val xs = p.points.map { it.x }; val ys = p.points.map { it.y }
-                                floatArrayOf(xs.min(), ys.min(), xs.max(), ys.max()) }
-                        }
-                        is DrawingPrimitive.RectanglePrimitive -> floatArrayOf(
-                            minOf(p.startX, p.endX), minOf(p.startY, p.endY),
-                            maxOf(p.startX, p.endX), maxOf(p.startY, p.endY))
-                        is DrawingPrimitive.CirclePrimitive -> {
-                            val r = maxOf(abs(p.endX - p.centerX), abs(p.endY - p.centerY))
-                            floatArrayOf(p.centerX - r, p.centerY - r, p.centerX + r, p.centerY + r)
-                        }
-                        is DrawingPrimitive.LinePrimitive -> {
-                            floatArrayOf(minOf(p.startX, p.endX), minOf(p.startY, p.endY),
-                                maxOf(p.startX, p.endX), maxOf(p.startY, p.endY))
-                        }
-                        is DrawingPrimitive.NumberLabelPrimitive -> floatArrayOf(p.x - 30f, p.y - 15f, p.x + 30f, p.y + 15f)
-                        is DrawingPrimitive.TextPrimitive -> floatArrayOf(p.x - 40f, p.y - 20f, p.x + 40f, p.y + 20f)
-                        else -> null
-                    }
-                    if (b != null) { cx += (b[0] + b[2]) / 2f; cy += (b[1] + b[3]) / 2f; count++ }
+                if (glow) {
+                    // 光晕外扩量 gInf 是屏幕 px，换算成块内局部单位（矩阵已含 s）
+                    drawBlockGlow(
+                        bd = bd, blockDefs = blockDefs,
+                        anchor = sc, rotationRad = totalRot, scale = s,
+                        strokeScale = contentStrokeScale,
+                        inflate = gInf / s.coerceAtLeast(0.001f),
+                        gc = glowColor,
+                        refStrokeWidth = primitive.strokeWidth,
+                        strokeFloorScale = blockFloor
+                    )
+                } else {
+                    // dashScale 用未除块缩放的 strokeScale：虚线图案随块放大，跟线宽解耦
+                    drawBlockContents(
+                        bd = bd, blockDefs = blockDefs,
+                        anchor = sc, rotationRad = totalRot, scale = s,
+                        contentStrokeScale = contentStrokeScale,
+                        dashScale = strokeScale,
+                        refStrokeWidth = primitive.strokeWidth,
+                        strokeFloorScale = blockFloor
+                    )
                 }
-                val centroidX = if (count > 0) cx / count else 0f
-                val centroidY = if (count > 0) cy / count else 0f
-
-                val pt = transform(primitive.x, primitive.y)
-                val totalRotation = edit.rotation + primitive.rotation
-                val avgScale = sqrt(abs(edit.scaleX * edit.scaleY))
-                val s = primitive.scale * avgScale
-                drawContext.canvas.save()
-                drawContext.canvas.translate(pt.x - centroidX * s * canvasScale, pt.y - centroidY * s * canvasScale)
-                drawContext.canvas.rotate(totalRotation * 180f / kotlin.math.PI.toFloat())
-                drawContext.canvas.scale(s, s)
-                for (prim in bd.primitives) {
-                    drawPrimitiveAt(prim, PendingEdit(), canvasScale, 0f, 0f, strokeScale, emptyList())
-                }
-                drawContext.canvas.restore()
             } else {
-                // Fallback placeholder
-                val pt = transform(primitive.x, primitive.y)
-                val totalRotation = edit.rotation + primitive.rotation
-                val avgScale = sqrt(abs(edit.scaleX * edit.scaleY))
-                val s = primitive.scale * avgScale
-                val halfSize = 30f * s * canvasScale
-                val color = primitive.color.copy(alpha = alpha)
-                val cosR = cos(totalRotation); val sinR = sin(totalRotation)
-                fun rotBox(lx: Float, ly: Float): Offset {
-                    val rx = lx * cosR - ly * sinR; val ry = lx * sinR + ly * cosR
-                    return Offset(pt.x + rx, pt.y + ry)
-                }
-                val boxCorners = listOf(
-                    rotBox(-halfSize, -halfSize), rotBox(halfSize, -halfSize),
-                    rotBox(halfSize, halfSize), rotBox(-halfSize, halfSize)
+                // 块定义缺失：与画布同一占位（预览在屏幕坐标系，笔宽系数并入 canvasScale）
+                drawBlockPlaceholder(
+                    center = sc,
+                    halfSize = 30f * s * canvasScale,
+                    strokeScale = contentStrokeScale * canvasScale,
+                    strokeWidth = primitive.strokeWidth,
+                    color = primitive.color,
+                    rotationRad = totalRot,
+                    lineStyle = primitive.lineStyle
                 )
-                val boxPath = Path().apply {
-                    moveTo(boxCorners[0].x, boxCorners[0].y)
-                    for (i in 1..3) lineTo(boxCorners[i].x, boxCorners[i].y)
-                    close()
-                }
-                drawPath(boxPath, color, style = Stroke(primitive.strokeWidth * canvasScale * strokeScale))
-                drawLine(color, boxCorners[0], boxCorners[2], strokeWidth = 2f * canvasScale)
-                drawLine(color, boxCorners[1], boxCorners[3], strokeWidth = 2f * canvasScale)
             }
         }
-        else -> {}
+        is DrawingPrimitive.RangeLabelPrimitive -> {
+            val sc = worldToScreen(primitive.x, primitive.y)
+            val drawX = sc.x; val drawY = sc.y
+            val nc = drawContext.canvas.nativeCanvas
+            // 待确认/选择变换：布局旋转角 = 图元旋转 + 编辑旋转（纯函数统一计算）。
+            // 屏幕空间计算：x/y、字号、arrowSpan 一并缩放，锚点直接落在屏幕坐标。
+            val fs = primitive.fontSize * canvasScale * avgScale
+            val spanScaled = primitive.arrowSpan * canvasScale * avgScale
+            val storedRotation = primitive.rotation + edit.rotation
+            val layout = RangeLabelLayout.compute(storedRotation, drawX, drawY, fs, spanScaled, primitive.reversed,
+                numberAngle = RangeLabelLayout.numberAngleFor(primitive.numbersFaceLeft))
+            val half = RangeLabelLayout.arrowHalfLength(spanScaled)
+            val paint = reusablePaint ?: Paint().apply {
+                color = strokeColor.toArgb()
+                textSize = fs
+                typeface = Typeface.DEFAULT_BOLD; isAntiAlias = true; textAlign = Paint.Align.CENTER
+            }
+            if (reusablePaint != null) {
+                paint.color = strokeColor.toArgb()
+                paint.textSize = fs
+            }
+            paint.style = if (glow) Paint.Style.FILL_AND_STROKE else Paint.Style.FILL
+            paint.strokeWidth = if (glow) 2f * gInf else 0f
+            // Arrow line + arrowhead（局部 (-half,0)→(+half,0) 绕中心按 arrowAngle 旋转）
+            val cosA = cos(layout.arrowAngle); val sinA = sin(layout.arrowAngle)
+            val ax1x = drawX - half * cosA; val ax1y = drawY - half * sinA
+            val ax2x = drawX + half * cosA; val ax2y = drawY + half * sinA
+            val sw = maxOf(2f * strokeScale * canvasScale, 1.5f * canvasScale) + 2f * gInf
+            drawLine(strokeColor, Offset(ax1x, ax1y), Offset(ax2x, ax2y), sw)
+            val hs = maxOf(maxOf(4f, primitive.fontSize * 0.3f * avgScale) * canvasScale, 1.5f * canvasScale)
+            val tipX = if (primitive.reversed) ax1x else ax2x
+            val tipY = if (primitive.reversed) ax1y else ax2y
+            // 翼公式统一走 RangeLabelLayout（与画布渲染、DXF 导出同源）
+            val (wing1, wing2) = RangeLabelLayout.arrowheadWingOffsets(layout.arrowAngle, primitive.reversed)
+            drawLine(strokeColor, Offset(tipX, tipY), Offset(tipX + hs * wing1.first, tipY + hs * wing1.second), sw)
+            drawLine(strokeColor, Offset(tipX, tipY), Offset(tipX + hs * wing2.first, tipY + hs * wing2.second), sw)
+            // 两端数字：锚点与绘制角由纯函数给出（朝下=正向 0 / 朝左=+90°）
+            val label1 = if (primitive.reversed) primitive.endValue.toString() else primitive.startValue.toString()
+            val label2 = if (primitive.reversed) primitive.startValue.toString() else primitive.endValue.toString()
+            fun drawRangeTextAt(text: String, anchor: com.scheda.app.model.RangeTextPlacement) {
+                val fm = paint.fontMetrics
+                val baseline = anchor.y - (fm.ascent + fm.descent) / 2f
+                if (kotlin.math.abs(anchor.angle) < 0.01f) {
+                    nc.drawText(text, anchor.x, baseline, paint)
+                } else {
+                    nc.save()
+                    nc.rotate(anchor.angle * 180f / kotlin.math.PI.toFloat(), anchor.x, anchor.y)
+                    nc.drawText(text, anchor.x, baseline, paint)
+                    nc.restore()
+                }
+            }
+            drawRangeTextAt(label1, layout.startText)
+            drawRangeTextAt(label2, layout.endText)
+        }
     }
 }
 
-/** Preview-specific range label content drawing */
-private fun DrawScope.drawPreviewLabelContent(
-    nc: android.graphics.Canvas, paint: Paint,
-    label1: String, label2: String,
-    cx: Float, cy: Float, fs: Float,
-    arrowLen: Float, gap: Float,
-    primitive: DrawingPrimitive.RangeLabelPrimitive,
-    alpha: Float, canvasScale: Float,
-    lineScale: Float
-) {
-    val leftX = cx - arrowLen / 2f - gap
-    val rightX = cx + arrowLen / 2f + gap
-    val textCenterY = cy + fs * 0.3f
-    if (primitive.reversed) {
-        nc.drawText(label2, leftX, textCenterY, paint)
-        nc.drawText(label1, rightX, textCenterY, paint)
-    } else {
-        nc.drawText(label1, leftX, textCenterY, paint)
-        nc.drawText(label2, rightX, textCenterY, paint)
+
+
+/** Compute tight half-dimensions for a primitive's selection/pending-edit frame.
+ *  Returns (halfW, halfH) for actual dimensions, or null to let PFO fall back to bounds+minHalf.
+ *  [scaleX]/[scaleY] 为 PFO 双轴向缩放：椭圆/矩形单轴拉伸时框架必须按各自轴向走，
+ *  不能用 sqrt(sx·sy) 均匀值，否则框架四向膨胀、元素超出包围盒。
+ *  minHalf is in units of canvasScale (i.e., world units), ~30dp worth. */
+private fun computePrimitiveHalfDims(
+    primitive: DrawingPrimitive, scaleX: Float, scaleY: Float,
+    globalLineScale: Float, canvasScale: Float,
+    minHalf: Float, textPaint: Paint,
+    blockDefs: List<BlockDef> = emptyList()
+): Pair<Float, Float>? {
+    // 文字/区间/直线/图块按面积等比缩放
+    val scaleFactor = sqrt(abs(scaleX * scaleY))
+    return when (primitive) {
+        is DrawingPrimitive.TextPrimitive -> {
+            // 文字大小不受线型比例影响，PFO 框与渲染一致
+            textPaint.textSize = primitive.fontSize * scaleFactor * 1.3f
+            val tw = textPaint.measureText(primitive.text)
+            val fm = textPaint.fontMetrics
+            Pair(
+                maxOf(tw / 2f, minHalf / canvasScale),
+                maxOf((fm.descent - fm.ascent) / 2f, minHalf / canvasScale)
+            )
+        }
+        is DrawingPrimitive.NumberLabelPrimitive -> {
+            textPaint.textSize = primitive.fontSize * scaleFactor * 1.3f
+            val tw = textPaint.measureText(primitive.value.toString())
+            val fm = textPaint.fontMetrics
+            var hw = maxOf(tw / 2f, minHalf / canvasScale)
+            var hh = maxOf((fm.descent - fm.ascent) / 2f, minHalf / canvasScale)
+            if (primitive.circled) {
+                // 选择框要包住外圈圆
+                val r = maxOf(tw / 2f, primitive.fontSize * scaleFactor * 0.65f) * 1.15f
+                hw = maxOf(hw, r); hh = maxOf(hh, r)
+            }
+            Pair(hw, hh)
+        }
+        is DrawingPrimitive.RangeLabelPrimitive -> {
+            textPaint.textSize = primitive.fontSize * scaleFactor
+            val tw1 = textPaint.measureText(primitive.startValue.toString())
+            val tw2 = textPaint.measureText(primitive.endValue.toString())
+            val fm = textPaint.fontMetrics
+            val arrowLen = maxOf(80f * primitive.arrowSpan, 20f) * scaleFactor
+            val gap = primitive.fontSize * scaleFactor
+            val textHh = (fm.descent - fm.ascent) / 2f
+            // 朝左（数字转 90°）时沿轴/垂直方向占用互换，框保持紧贴
+            val hw = if (primitive.numbersFaceLeft) arrowLen / 2f + gap + textHh
+                else arrowLen / 2f + maxOf(tw1, tw2) / 2f + gap
+            val hh = if (primitive.numbersFaceLeft) maxOf(tw1, tw2) / 2f
+                else textHh
+            Pair(
+                maxOf(hw, minHalf / canvasScale),
+                maxOf(hh, minHalf / canvasScale)
+            )
+        }
+        is DrawingPrimitive.RectanglePrimitive -> {
+            val xs = primitive.corners.map { it.x }; val ys = primitive.corners.map { it.y }
+            val hw = (xs.max() - xs.min()) / 2f; val hh = (ys.max() - ys.min()) / 2f
+            Pair(
+                maxOf(hw * abs(scaleX), minHalf / canvasScale),
+                maxOf(hh * abs(scaleY), minHalf / canvasScale)
+            )
+        }
+        is DrawingPrimitive.CirclePrimitive -> {
+            Pair(
+                maxOf(primitive.radiusX * abs(scaleX), minHalf / canvasScale),
+                maxOf(primitive.radiusY * abs(scaleY), minHalf / canvasScale)
+            )
+        }
+        is DrawingPrimitive.BlockRefPrimitive -> {
+            // 按块实际内容算半尺寸（未旋转内容 AABB × scale），框随 frameRotation 贴合
+            val cb = blockDefs.find { it.id == primitive.blockDefId }
+                ?.primitives?.let { unionAabb(it, textPaint) }
+            if (cb != null) {
+                Pair(
+                    maxOf((cb[2] - cb[0]) / 2f * primitive.scale * scaleFactor, minHalf / canvasScale),
+                    maxOf((cb[3] - cb[1]) / 2f * primitive.scale * scaleFactor, minHalf / canvasScale)
+                )
+            } else {
+                val s = maxOf(50f * primitive.scale * scaleFactor / 2f, minHalf / canvasScale)
+                Pair(s, s)
+            }
+        }
+        is DrawingPrimitive.LinePrimitive -> {
+            val dx = primitive.endX - primitive.startX
+            val dy = primitive.endY - primitive.startY
+            val halfLen = sqrt(dx * dx + dy * dy) / 2f * scaleFactor
+            val halfH = maxOf(15f * scaleFactor, minHalf / canvasScale)
+            Pair(maxOf(halfLen, minHalf / canvasScale), halfH)
+        }
+        // FreehandPath → use bounds fallback
+        else -> null
     }
-    val arrowY = cy
-    val ap = Paint().apply { color = primitive.color.copy(alpha = alpha).hashCode(); strokeWidth = 2f * lineScale * canvasScale; isAntiAlias = true }
-    val arrowStartX = cx - arrowLen / 2f; val arrowEndX = cx + arrowLen / 2f
-    nc.drawLine(arrowStartX, arrowY, arrowEndX, arrowY, ap)
-    val headSize = maxOf(4f, primitive.fontSize * 0.3f) * lineScale * canvasScale
-    if (primitive.reversed) {
-        nc.drawLine(arrowStartX, arrowY, arrowStartX + headSize, arrowY - headSize, ap)
-        nc.drawLine(arrowStartX, arrowY, arrowStartX + headSize, arrowY + headSize, ap)
-    } else {
-        nc.drawLine(arrowEndX, arrowY, arrowEndX - headSize, arrowY - headSize, ap)
-        nc.drawLine(arrowEndX, arrowY, arrowEndX - headSize, arrowY + headSize, ap)
+}
+
+
+/** 一组基元的并集 AABB（BlockDef 内容等），无内容返回 null */
+private fun unionAabb(prims: List<DrawingPrimitive>, paint: Paint): FloatArray? {
+    var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE
+    var maxX = -Float.MAX_VALUE; var maxY = -Float.MAX_VALUE
+    var has = false
+    for (p in prims) {
+        val b = p.computeBounds(paint) ?: continue
+        has = true
+        minX = minOf(minX, b[0]); minY = minOf(minY, b[1])
+        maxX = maxOf(maxX, b[2]); maxY = maxOf(maxY, b[3])
     }
+    return if (has) floatArrayOf(minX, minY, maxX, maxY) else null
+}
+
+/** 单个基元的世界 AABB；BlockRef 按块实际内容经渲染同款变换计算，其余走 computeBounds */
+private fun pfoWorldBounds(p: DrawingPrimitive, blockDefs: List<BlockDef>, paint: Paint): FloatArray? {
+    if (p is DrawingPrimitive.BlockRefPrimitive) {
+        val bd = blockDefs.find { it.id == p.blockDefId } ?: return null
+        val cb = unionAabb(bd.primitives, paint) ?: return null
+        // 与 BlockRender.withBlockTransform 同一映射（model.BlockTransform.blockMapPoint）
+        val centroid = blockContentCentroid(bd.primitives) ?: return null
+        fun mp(wx: Float, wy: Float): Point2D = blockMapPoint(wx, wy, p, centroid)
+        val pts = listOf(mp(cb[0], cb[1]), mp(cb[2], cb[1]), mp(cb[2], cb[3]), mp(cb[0], cb[3]))
+        return floatArrayOf(pts.minOf { it.x }, pts.minOf { it.y }, pts.maxOf { it.x }, pts.maxOf { it.y })
+    }
+    // 矩形的 computeBounds 不含旋转，多选合并框需要含旋转的世界 AABB
+    if (p is DrawingPrimitive.RectanglePrimitive) return p.worldBounds()
+    return p.computeBounds(paint)
 }

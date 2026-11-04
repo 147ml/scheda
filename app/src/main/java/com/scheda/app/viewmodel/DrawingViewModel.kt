@@ -1,25 +1,40 @@
 package com.scheda.app.viewmodel
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Typeface
 import android.net.Uri
+import android.util.Base64
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.lifecycle.ViewModel
-import com.scheda.app.export.DxfWriter
+import androidx.lifecycle.viewModelScope
+import com.scheda.app.file.PendingWrites
+import com.scheda.app.export.DxfExporter
 import com.scheda.app.file.DocumentData
 import com.scheda.app.file.RecoveryManager
 import com.scheda.app.file.SchedaSerializer
 import com.scheda.app.file.StorageManager
 import com.scheda.app.model.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.UUID
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -50,9 +65,39 @@ class DrawingViewModel(
         private const val KEY_PENDING_TEXT = "pending_text"
         private const val KEY_CONSTRAINT = "constraint"
         private const val KEY_SNAP = "snap"
+        private const val KEY_TEXT_HORIZONTAL = "text_horizontal"
+        private const val KEY_RANGE_ARROW_SPAN = "range_arrow_span"
+        private const val KEY_RANGE_FS = "range_font_size"
+        private const val KEY_RANGE_HORIZONTAL = "range_horizontal_only"
+        private const val KEY_RANGE_REVERSED = "range_reversed"
+        private const val KEY_RANGE_NUMBERS_FACE_LEFT = "range_numbers_face_left"
+        private const val KEY_QUICK_ERASE = "quick_erase"
+        private const val KEY_FINE_ERASE = "fine_erase"
+        private const val KEY_RECT_SQUARE = "rect_square"
+        private const val KEY_CIRCLE_MODE = "circle_mode"
+        private const val KEY_LINE_SNAP = "line_snap"
+        private const val KEY_NUM_HORIZONTAL = "num_horizontal_only"
+        private const val KEY_NUM_CIRCLED = "num_circled"
+        private const val KEY_LANDSCAPE = "landscape_mode"
+        private const val KEY_ORTHO = "ortho_mode"
+        private const val KEY_NARR_START = "num_array_start"
+        private const val KEY_NARR_END = "num_array_end"
+        private const val KEY_NARR_FS = "num_array_font_size"
+        private const val KEY_NARR_GAP = "num_array_gap"
+        private const val KEY_NARR_VERTICAL = "num_array_vertical" // 旧版竖向标记（仅兼容读取）
+        private const val KEY_NARR_ROTATION = "num_array_rotation"
+        private const val KEY_NARR_CIRCLED = "num_array_circled"
+        const val MAX_UNDO_HISTORY = 50
+        /** 自动保存防抖窗口：合并拖滑条产生的连续触发 */
+        private const val SAVE_DEBOUNCE_MS = 250L
     }
 
     private val sessionPrefs = appContext.getSharedPreferences(PREFS_SESSION, Context.MODE_PRIVATE)
+
+    // ─── Reusable Paint for computeBounds (avoids per-call allocation) ──
+    private val boundsMeasurePaint = Paint().apply {
+        typeface = Typeface.DEFAULT_BOLD; isAntiAlias = true; textAlign = Paint.Align.CENTER
+    }
 
     // ─── 绘图基元 ──────────────────────────────────────────
     private val _primitives = mutableStateListOf<DrawingPrimitive>()
@@ -84,6 +129,67 @@ class DrawingViewModel(
     private val _canvasOffsetY = mutableStateOf(0f)
     val canvasOffsetY: Float get() = _canvasOffsetY.value
 
+    // ─── 横屏模式：UI 布局不变，画布内容与交互逻辑整体旋转 90° ──
+    private val _isLandscape = mutableStateOf(false)
+    val isLandscape: Boolean get() = _isLandscape.value
+
+    fun toggleOrientation() {
+        _isLandscape.value = !_isLandscape.value
+        // 只更新工具状态（新建区间数字时继承此值），不修改画布上已确认的区间数字。
+        _rangeLabel.value = _rangeLabel.value.copy(numbersFaceLeft = _isLandscape.value)
+        // 待确认中的区间数字同步更新朝向
+        val pe = _pendingEdit.value
+        if (pe.isActive() && pe.primitive is DrawingPrimitive.RangeLabelPrimitive) {
+            val p = pe.primitive as DrawingPrimitive.RangeLabelPrimitive
+            _pendingEdit.value = pe.copy(primitive = p.copy(numbersFaceLeft = _isLandscape.value))
+        }
+        saveSettings()
+    }
+
+    // ─── 正交模式：移动约束到水平/垂直轴（拖动会话首判主方向后锁轴）、旋转吸附 45° 档 ──
+    private val _orthoMode = mutableStateOf(false)
+    val orthoMode: Boolean get() = _orthoMode.value
+    /** 正交移动会话（选择/待确认各一套，避免跨模式串扰） */
+    private class OrthoSession {
+        var last = 0L
+        var accX = 0f
+        var accY = 0f
+        var axis = -1                    // -1=未定轴 0=水平 1=垂直
+    }
+    private val _orthoSel = OrthoSession()
+    private val _orthoPe = OrthoSession()
+    private var _orthoFreeRot: Float? = null
+    private var _orthoPeFreeRot: Float? = null
+
+    fun toggleOrthoMode() {
+        _orthoMode.value = !_orthoMode.value
+        _orthoFreeRot = null; _orthoPeFreeRot = null
+        _orthoSel.axis = -1; _orthoPe.axis = -1
+        saveSettings()
+    }
+
+    /** 正交移动约束（会话级）：累计超过阈值后按主方向定轴、只放行该轴增量。
+     *  [forceNewSession]=拖动手势首帧（重置累计与轴）；否则 2.5s 无操作兜底视为新会话。
+     *  [pe]=true 使用"待确认偏移"独立会话（避免与选择移动互相污染）。
+     *  阈值按屏幕等效（8px）折算世界单位；未达阈值前也按当前主方向投影（不产生非正交残余）。 */
+    private fun applyOrthoConstraint(dx: Float, dy: Float, forceNewSession: Boolean = false, pe: Boolean = false): Pair<Float, Float> {
+        if (!_orthoMode.value) return dx to dy
+        val s = if (pe) _orthoPe else _orthoSel
+        val now = System.currentTimeMillis()
+        if (forceNewSession || now - s.last > 2500L) { s.accX = 0f; s.accY = 0f; s.axis = -1 }
+        s.last = now
+        s.accX += dx; s.accY += dy
+        if (s.axis == -1) {
+            if (maxOf(abs(s.accX), abs(s.accY)) > 8f / maxOf(canvasScale, 0.01f)) {
+                s.axis = if (abs(s.accX) >= abs(s.accY)) 0 else 1
+            } else {
+                // 未达阈值：不锁轴，但已按当前主方向投影（消除非正交残余）
+                return if (abs(s.accX) >= abs(s.accY)) dx to 0f else 0f to dy
+            }
+        }
+        return if (s.axis == 0) dx to 0f else 0f to dy
+    }
+
     // ─── 工具状态 ─────────────────────────────────────────
     private val _currentTool = mutableStateOf(ToolType.FREEHAND)
     val currentTool: ToolType get() = _currentTool.value
@@ -91,7 +197,7 @@ class DrawingViewModel(
     private val _currentColor = mutableStateOf(Color.Black)
     val currentColor: Color get() = _currentColor.value
 
-    private val _currentStrokeWidth = mutableFloatStateOf(4f)
+    private val _currentStrokeWidth = mutableFloatStateOf(5f)
     val strokeWidth: Float get() = _currentStrokeWidth.value
 
     private val _currentLineStyle = mutableStateOf(LineStyle())
@@ -114,6 +220,219 @@ class DrawingViewModel(
     private val _activeLayerId = mutableIntStateOf(0)
     val activeLayerId: Int get() = _activeLayerId.value
 
+    // ─── 参考图片（画布最底层底图；不参与选择/橡皮，仅经管理面板调整）───
+    private val _images = mutableStateListOf<ReferenceImage>()
+    val images: List<ReferenceImage> get() = _images
+
+    /** id → 解码位图。Compose 可观察：后台解码完成后触发画布重绘 */
+    val imageBitmaps = mutableStateMapOf<String, Bitmap>()
+
+    // 图片管理模式：管理面板悬浮于画布之上，画布与已有图形始终可见
+    private val _imageManageActive = mutableStateOf(false)
+    val imageManageActive: Boolean get() = _imageManageActive.value
+
+    private val _imgSelectedId = mutableStateOf<String?>(null)
+    val imgSelectedId: String? get() = _imgSelectedId.value
+
+    val selectedImage: ReferenceImage? get() = _images.firstOrNull { it.id == _imgSelectedId.value }
+
+    /** 进入图片管理模式：与图元选择互斥——先清掉已有选择，避免选择框/端点球和图片框同屏 */
+    private fun beginImageManage() {
+        if (_selection.value.selectedIndices.isNotEmpty()) clearSelection()
+        _imageManageActive.value = true
+    }
+
+    fun enterImageManage() = beginImageManage()
+
+    fun exitImageManage() {
+        if (_imgSelectedId.value != null) { _imgSelectedId.value = null; autoSave() }
+        _imageManageActive.value = false
+    }
+
+    /** 选中图片进入调整（画布上出现 PFO 框）；undo 记录到选中前，一次撤销回滚整段调整 */
+    fun selectImage(id: String) {
+        if (_imgSelectedId.value == id) { deselectImage(); return }
+        _imgSelectedId.value = id
+        pushUndo()
+    }
+
+    fun deselectImage() {
+        if (_imgSelectedId.value != null) { _imgSelectedId.value = null; autoSave() }
+    }
+
+    private fun updateSelectedImage(update: (ReferenceImage) -> ReferenceImage) {
+        val id = _imgSelectedId.value ?: return
+        val idx = _images.indexOfFirst { it.id == id }
+        if (idx >= 0) _images[idx] = update(_images[idx])
+    }
+
+    fun moveSelectedImage(dx: Float, dy: Float) =
+        updateSelectedImage { it.copy(centerX = it.centerX + dx, centerY = it.centerY + dy) }
+
+    /** 等比缩放（保持宽高比；夹紧下限防止拖没） */
+    fun scaleSelectedImage(factor: Float) = updateSelectedImage {
+        val minDim = min(it.width, it.height)
+        val f = factor.coerceIn(20f / minDim, 100f)
+        it.copy(width = it.width * f, height = it.height * f)
+    }
+
+    /** 旋转（90° 吸附：距最近直角 ≤5° 时吸住，形成档位感，方便扫描图对齐坐标轴） */
+    fun rotateSelectedImage(rad: Float) = updateSelectedImage {
+        val deg = ((it.rotationDeg + Math.toDegrees(rad.toDouble()).toFloat()) % 360f + 360f) % 360f
+        val nearestRaw = (deg / 90f).roundToInt() * 90  // 允许得 360（等价 0），处理跨界
+        it.copy(rotationDeg = if (abs(deg - nearestRaw) <= 5f) (nearestRaw % 360).toFloat() else deg)
+    }
+
+    /** 正交步进旋转（图片）：精确 ±90°，不走 90° 吸附。 */
+    fun stepRotateSelectedImage(rad: Float) = updateSelectedImage {
+        val deg = ((it.rotationDeg + Math.toDegrees(rad.toDouble()).toFloat()) % 360f + 360f) % 360f
+        it.copy(rotationDeg = deg)
+    }
+
+    fun setSelectedImageAlpha(a: Float) =
+        updateSelectedImage { it.copy(alpha = a.coerceIn(0.05f, 1f)) }
+
+    /** 把选中图片移到指定图层（图片仍恒垫底，仅随图层显隐/导出；计入选中会话的一次 undo） */
+    fun moveSelectedImageToLayer(layerId: Int) =
+        updateSelectedImage { it.copy(layerId = layerId) }
+
+    /** 图片重命名（空白名回落由 UI 处理，这里只存原值） */
+    fun renameImage(id: String, name: String) {
+        val idx = _images.indexOfFirst { it.id == id }
+        if (idx < 0) return
+        pushUndo()
+        _images[idx] = _images[idx].copy(name = name.trim())
+        autoSave()
+    }
+
+    /** 单张图片显隐：隐藏=不绘制、不导出 DXF */
+    fun setImageVisible(id: String, visible: Boolean) {
+        val idx = _images.indexOfFirst { it.id == id }
+        if (idx < 0) return
+        if (_images[idx].visible == visible) return
+        pushUndo()
+        _images[idx] = _images[idx].copy(visible = visible)
+        autoSave()
+    }
+
+    /** 把视图平移到指定图片中心（缩略图/管理页「定位」用；viewport 为画布像素尺寸） */
+    fun focusImage(id: String, viewportW: Float, viewportH: Float) {
+        val img = _images.firstOrNull { it.id == id } ?: return
+        if (viewportW <= 0f || viewportH <= 0f) return
+        val s = _canvasScale.value
+        _canvasOffsetX.value = viewportW / 2f - img.centerX * s
+        _canvasOffsetY.value = viewportH / 2f - img.centerY * s
+    }
+
+    fun deleteImage(id: String) {
+        val idx = _images.indexOfFirst { it.id == id }
+        if (idx < 0) return
+        pushUndo()
+        if (_imgSelectedId.value == id) _imgSelectedId.value = null
+        imageBitmaps.remove(id)
+        _images.removeAt(idx)
+        autoSave()
+    }
+
+    /** 系统图库选择器回调：后台解码（降采样 + EXIF 转正 + JPEG Base64），插入即进入调整 */
+    fun importReferenceImage(uri: Uri) {
+        viewModelScope.launch {
+            val decoded = withContext(Dispatchers.IO) { decodeImageForImport(uri) }
+            if (decoded == null) {
+                android.widget.Toast.makeText(appContext, "图片读取失败", android.widget.Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+            val (bmp, base64) = decoded
+            // 初始摆放：当前视口中心、宽取视口世界宽 60%（保宽高比）
+            val dm = appContext.resources.displayMetrics
+            val worldW = (dm.widthPixels / _canvasScale.value) * 0.6f
+            val worldH = worldW * bmp.height / bmp.width
+            val img = ReferenceImage(
+                id = UUID.randomUUID().toString(),
+                data = base64,
+                centerX = (dm.widthPixels / 2f - _canvasOffsetX.value) / _canvasScale.value,
+                centerY = (dm.heightPixels / 2f - _canvasOffsetY.value) / _canvasScale.value,
+                width = worldW, height = worldH,
+                layerId = _activeLayerId.value,
+                pixelWidth = bmp.width, pixelHeight = bmp.height
+            )
+            pushUndo()
+            _images.add(img)
+            imageBitmaps[img.id] = bmp
+            // 插入即调：自动进入管理模式并选中新图（PFO 框就位，画布上立即可见）
+            beginImageManage()
+            _imgSelectedId.value = img.id
+            autoSave()
+        }
+    }
+
+    /** 后台解码：降采样至长边 ≤2048，按 EXIF 方向转正，重编码 JPEG(q85) Base64 */
+    private fun decodeImageForImport(uri: Uri): Pair<Bitmap, String>? {
+        return try {
+            val resolver = appContext.contentResolver
+            // 1) 只读尺寸
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            // 2) 降采样解码（RGB_565：参考图只作底图描图用，不需要 8bit 通道，
+            //    内存直接减半 —— 2048px 的图按 ARGB_8888 是 12MB/张，多图必爆堆）
+            var sample = 1
+            val maxDim = maxOf(bounds.outWidth, bounds.outHeight)
+            while (maxDim / sample > 2048) sample *= 2
+            val opts = BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = Bitmap.Config.RGB_565
+            }
+            var bmp = resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) } ?: return null
+            // 3) EXIF 方向转正
+            val orientation = resolver.openInputStream(uri)?.use {
+                android.media.ExifInterface(it).getAttributeInt(
+                    android.media.ExifInterface.TAG_ORIENTATION,
+                    android.media.ExifInterface.ORIENTATION_NORMAL
+                )
+            } ?: android.media.ExifInterface.ORIENTATION_NORMAL
+            val deg = when (orientation) {
+                android.media.ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                android.media.ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                android.media.ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                else -> 0f
+            }
+            if (deg != 0f) {
+                val m = Matrix().apply { postRotate(deg) }
+                val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+                if (rotated != bmp) bmp.recycle()
+                bmp = rotated
+            }
+            // 4) JPEG Base64
+            val baos = ByteArrayOutputStream()
+            bmp.compress(Bitmap.CompressFormat.JPEG, 85, baos)
+            bmp to Base64.encodeToString(baos.toByteArray(), Base64.DEFAULT)
+        } catch (e: Exception) {
+            android.util.Log.e("RefImage", "decode failed", e)
+            null
+        }
+    }
+
+    /** 文档加载后为图片后台解码位图；写缓存完成自动触发画布重绘 */
+    private fun decodeImageBitmapsAsync(images: List<ReferenceImage>) {
+        viewModelScope.launch(Dispatchers.Default) {
+            // RGB_565 解码：同尺寸下内存只有 ARGB_8888 的一半（参考图只用于描绘底图）
+            val opts = BitmapFactory.Options().apply {
+                inPreferredConfig = Bitmap.Config.RGB_565
+            }
+            for (img in images) {
+                if (imageBitmaps.containsKey(img.id)) continue
+                try {
+                    val bytes = Base64.decode(img.data, Base64.DEFAULT)
+                    val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: continue
+                    withContext(Dispatchers.Main) { imageBitmaps[img.id] = bmp }
+                } catch (e: Exception) {
+                    android.util.Log.e("RefImage", "decode base64 failed: ${img.id}", e)
+                }
+            }
+        }
+    }
+
     // ─── 撤销/重做 ───────────────────────────────────────
     private data class UndoSnapshot(
         val primitives: List<DrawingPrimitive>,
@@ -125,7 +444,10 @@ class DrawingViewModel(
         val activeLayerId: Int,
         val lastTextFontSize: Float,
         val lastNumberFontSize: Float,
-        val numberLabel: NumberLabel
+        val numberLabel: NumberLabel,
+        val selectedIndices: Set<Int> = emptySet(),
+        val selectionRotation: Float = 0f,
+        val images: List<ReferenceImage> = emptyList()
     )
 
     private fun takeSnapshot() = UndoSnapshot(
@@ -138,13 +460,23 @@ class DrawingViewModel(
         activeLayerId = _activeLayerId.value,
         lastTextFontSize = _lastTextFontSize,
         lastNumberFontSize = _lastNumberFontSize,
-        numberLabel = _numberLabel.value
+        numberLabel = _numberLabel.value,
+        selectedIndices = _selection.value.selectedIndices,
+        selectionRotation = _selection.value.rotation,
+        images = _images.toList()
     )
 
     private fun restoreSnapshot(s: UndoSnapshot) {
         _primitives.clear(); _primitives.addAll(s.primitives)
         _layers.clear(); _layers.addAll(s.layers)
         _blockDefs.clear(); _blockDefs.addAll(s.blockDefs)
+        _images.clear(); _images.addAll(s.images)
+        // 撤销删除等操作可能恢复出缓存中已清除的位图 → 重新解码（已缓存的自动跳过）
+        if (s.images.isNotEmpty()) decodeImageBitmapsAsync(s.images)
+        // 撤销后图片可能已不存在 → 清掉悬空的选中态
+        if (_imgSelectedId.value != null && _images.none { it.id == _imgSelectedId.value }) {
+            _imgSelectedId.value = null
+        }
         _canvasOffsetX.value = s.canvasOffsetX
         _canvasOffsetY.value = s.canvasOffsetY
         _canvasScale.value = s.canvasScale
@@ -152,13 +484,150 @@ class DrawingViewModel(
         _lastTextFontSize = s.lastTextFontSize
         _lastNumberFontSize = s.lastNumberFontSize
         _numberLabel.value = s.numberLabel
+        // Restore selection if indices are still valid
+        val validIndices = s.selectedIndices.filter { it < _primitives.size }.toSet()
+        if (validIndices.isNotEmpty()) {
+            _selection.value = SelectionState(
+                selectedIndices = validIndices,
+                bounds = computeSelectionBounds(validIndices),
+                rotation = s.selectionRotation
+            )
+        } else {
+            _selection.value = SelectionState()
+        }
     }
 
     private fun pushUndo() {
         undoHistory.add(takeSnapshot())
-        _canUndo.value = true
+        if (undoHistory.size > MAX_UNDO_HISTORY) {
+            undoHistory.removeAt(0)
+        }
+        _canUndo.value = undoHistory.isNotEmpty()
         redoHistory.clear()
         _canRedo.value = false
+    }
+
+    // ─── 撤销历史持久化（随 .scheda 图纸文件保存，重开后仍可撤销）───
+    // 增量池格式：相邻快照共享绝大多数对象，全历史只序列化一份图纸数据 + 索引数组。
+    // 池按引用去重（IdentityHashMap），与内存中快照共享同一批实例的语义一致。
+    private fun packUndoHistory(): com.scheda.app.model.SerializableUndoHistory {
+        val primIds = java.util.IdentityHashMap<DrawingPrimitive, Int>()
+        val layerIds = java.util.IdentityHashMap<Layer, Int>()
+        val blockDefIds = java.util.IdentityHashMap<BlockDef, Int>()
+        val imageIds = java.util.IdentityHashMap<ReferenceImage, Int>()
+        val primPool = ArrayList<com.scheda.app.model.SerializablePrimitive>()
+        val layerPool = ArrayList<com.scheda.app.model.SerializableLayer>()
+        val blockDefPool = ArrayList<com.scheda.app.model.SerializableBlockDef>()
+        val imagePool = ArrayList<ReferenceImage>()
+        // 池条目只保留变换元数据；位图数据按 id 收敛到 imageData 一份。
+        // 文档 images 里已有的图不重复收录（加载时直接从文档回填），避免同一位图存两份。
+        val liveImageIds = _images.map { it.id }.toHashSet()
+        val imageData = HashMap<String, String>()
+
+        fun primRef(p: DrawingPrimitive): Int = primIds[p] ?: run {
+            primPool.add(serializer.primitiveToSerializable(p))
+            (primPool.size - 1).also { primIds[p] = it }
+        }
+        fun layerRef(l: Layer): Int = layerIds[l] ?: run {
+            layerPool.add(serializer.layerToSerializable(l))
+            (layerPool.size - 1).also { layerIds[l] = it }
+        }
+        fun blockDefRef(b: BlockDef): Int = blockDefIds[b] ?: run {
+            blockDefPool.add(serializer.blockDefToSerializable(b))
+            (blockDefPool.size - 1).also { blockDefIds[b] = it }
+        }
+        fun imageRef(i: ReferenceImage): Int = imageIds[i] ?: run {
+            imagePool.add(i.stripDataForUndoPool(liveImageIds, imageData))
+            (imagePool.size - 1).also { imageIds[i] = it }
+        }
+
+        val snapshots = undoHistory.map { s ->
+            com.scheda.app.model.SerializableUndoSnapshotRef(
+                primitiveRefs = s.primitives.map { primRef(it) },
+                layerRefs = s.layers.map { layerRef(it) },
+                blockDefRefs = s.blockDefs.map { blockDefRef(it) },
+                imageRefs = s.images.map { imageRef(it) },
+                activeLayerId = s.activeLayerId,
+                canvasOffsetX = s.canvasOffsetX,
+                canvasOffsetY = s.canvasOffsetY,
+                canvasScale = s.canvasScale,
+                lastTextFontSize = s.lastTextFontSize,
+                lastNumberFontSize = s.lastNumberFontSize,
+                numberLabel = s.numberLabel,
+                selectedIndices = s.selectedIndices,
+                selectionRotation = s.selectionRotation
+            )
+        }
+        return com.scheda.app.model.SerializableUndoHistory(
+            primitivePool = primPool,
+            layerPool = layerPool,
+            blockDefPool = blockDefPool,
+            imagePool = imagePool,
+            snapshots = snapshots,
+            imageData = imageData.ifEmpty { null }
+        )
+    }
+
+    /** 解包增量格式：池条目只转换一次，恢复出的快照与内存语义一致（共享实例） */
+    private fun unpackUndoHistory(h: com.scheda.app.model.SerializableUndoHistory): List<UndoSnapshot> {
+        // 基元转换可能失败（未知类型），保留 null 占位使索引不偏移，引用处再跳过
+        val primPool: List<DrawingPrimitive?> = h.primitivePool.map { serializer.serializableToPrimitive(it) }
+        val layerPool = h.layerPool.map { serializer.serializableToLayer(it) }
+        val blockDefPool = h.blockDefPool.map { serializer.serializableToBlockDef(it) }
+        // 池条目不携带位图数据（增量格式）：按 id 从 imageData（已删除的图）或文档 images（现存图）回填
+        val liveImageData = _images.associate { it.id to it.data }
+        val imagePool: List<ReferenceImage> = h.imagePool.map { img ->
+            if (img.data.isNotEmpty()) img // 旧版格式：条目自带数据
+            else img.copy(data = h.imageData?.get(img.id) ?: liveImageData[img.id] ?: "")
+        }
+        return h.snapshots.map { s ->
+            UndoSnapshot(
+                primitives = s.primitiveRefs.mapNotNull { primPool.getOrNull(it) },
+                layers = s.layerRefs.mapNotNull { layerPool.getOrNull(it) },
+                blockDefs = s.blockDefRefs.mapNotNull { blockDefPool.getOrNull(it) },
+                canvasOffsetX = s.canvasOffsetX,
+                canvasOffsetY = s.canvasOffsetY,
+                canvasScale = s.canvasScale,
+                activeLayerId = s.activeLayerId,
+                lastTextFontSize = s.lastTextFontSize,
+                lastNumberFontSize = s.lastNumberFontSize,
+                numberLabel = s.numberLabel ?: NumberLabel(),
+                selectedIndices = s.selectedIndices,
+                selectionRotation = s.selectionRotation,
+                images = s.imageRefs.mapNotNull { imagePool.getOrNull(it) }
+            )
+        }
+    }
+
+    private fun serializableToUndoSnapshot(s: com.scheda.app.model.SerializableUndoSnapshot) = UndoSnapshot(
+        primitives = s.primitives.mapNotNull { serializer.serializableToPrimitive(it) },
+        layers = s.layers.map { serializer.serializableToLayer(it) },
+        blockDefs = s.blockDefs.map { serializer.serializableToBlockDef(it) },
+        canvasOffsetX = s.canvasOffsetX,
+        canvasOffsetY = s.canvasOffsetY,
+        canvasScale = s.canvasScale,
+        activeLayerId = s.activeLayerId,
+        lastTextFontSize = s.lastTextFontSize,
+        lastNumberFontSize = s.lastNumberFontSize,
+        numberLabel = s.numberLabel ?: NumberLabel(),
+        selectedIndices = s.selectedIndices,
+        selectionRotation = s.selectionRotation
+    )
+
+    /** 从文件恢复撤销历史（旧版文件无此字段则跳过；优先新增量格式，兼容旧全量格式） */
+    private fun restoreUndoHistory(
+        hist: List<com.scheda.app.model.SerializableUndoSnapshot>?,
+        histV2: com.scheda.app.model.SerializableUndoHistory? = null
+    ) {
+        val snapshots = when {
+            histV2 != null -> unpackUndoHistory(histV2)
+            !hist.isNullOrEmpty() -> hist.map { serializableToUndoSnapshot(it) }
+            else -> return
+        }
+        if (snapshots.isEmpty()) return
+        undoHistory.clear()
+        for (s in snapshots.takeLast(MAX_UNDO_HISTORY)) undoHistory.add(s)
+        _canUndo.value = undoHistory.isNotEmpty()
     }
 
     private val undoHistory = mutableListOf<UndoSnapshot>()
@@ -181,6 +650,22 @@ class DrawingViewModel(
     private val _rangeLabel = mutableStateOf(RangeLabel())
     val rangeLabel: RangeLabel get() = _rangeLabel.value
 
+    // ─── 数字阵列 ─────────────────────────────────────────
+    private val _numArrayLabel = mutableStateOf(NumArrayLabel())
+    val numArrayLabel: NumArrayLabel get() = _numArrayLabel.value
+    /** 数字阵列编辑模式（已生成未确认，手柄/工具栏可调） */
+    private val _numArrayActive = mutableStateOf(false)
+    val numArrayActive: Boolean get() = _numArrayActive.value
+    /** 本组生成数字在 _primitives 中的索引（生成后不再变动，编辑=整组重建） */
+    private var numArrayIndices: List<Int> = emptyList()
+    var numArrayBaseX = 0f
+        private set
+    var numArrayBaseY = 0f
+        private set
+
+    // ─── 文档级工具预设（从 .scheda 读写）────────────
+    var docDefaultArrowSpan: Float = 1f
+
     // ─── 橡皮擦 ───────────────────────────────────────────
     private val _eraserRadius = mutableFloatStateOf(200f)   // 内部值=显示值×10，默认显示20
     val eraserRadius: Float get() = _eraserRadius.value
@@ -195,6 +680,31 @@ class DrawingViewModel(
     val isTemporaryEraser: Boolean get() = _isTemporaryEraser.value
     private var _previousToolBeforeEraser: ToolType = ToolType.FREEHAND
     private var _eraserUndoPushed = false
+    // 橡皮擦落下点：落下时不立即擦除，等移动（拖动擦）或抬起（点按擦）再执行，
+    // 避免双指缩放的第一触点触发"擦除→快照→取消→撤销→存盘"的卡顿链
+    private var eraserDownPoint: Point2D? = null
+    private var _rectMidpointActive = false
+    // ── 矩形中点拖拽锁定状态（2026-10-13，越界翻转修复）──────────────
+    // 拖动首帧把矩形 corners 规范化为 [TL,TR,BR,BL] 固定顺序并锁定"被拖边的两点索引"，
+    // 后续帧只移动锁定两点、不再每帧 min/max 重排（否则越过对边后语义换边、图形乱动）。
+    // 旋转矩形：改用"带符号半宽+中心"持续累加（保持存储恒为轴对齐的不变量），负半宽=翻转。
+    private var _rectDragCornerIdx: IntArray? = null
+    private var _rectDragNormalLockX: Float = 0f
+    private var _rectDragNormalLockY: Float = 0f
+    private var _rectDragRotSigned: FloatArray? = null      // [cAx, cAy, hxSig, hySig]（带符号半宽）
+    private var _rectDragRotLocalNx: Float = 0f
+    private var _rectDragRotLocalNy: Float = 0f
+    private val _rectDragHandleWorld = mutableStateOf<Point2D?>(null)
+    /** 被拖边中点（世界坐标；PFO 用它让被拖手柄跟随该边；未拖拽=null） */
+    val rectDragHandleWorld: Point2D? get() = _rectDragHandleWorld.value
+
+    /** 清空矩形中点拖拽锁定状态（finalize/取消/清空选择时调用） */
+    private fun clearRectDragLocks() {
+        _rectDragCornerIdx = null; _rectDragRotSigned = null
+        _rectDragNormalLockX = 0f; _rectDragNormalLockY = 0f
+        _rectDragRotLocalNx = 0f; _rectDragRotLocalNy = 0f
+        _rectDragHandleWorld.value = null
+    }
     private val _fineEraseEnabled = mutableStateOf(true)
     val fineEraseEnabled: Boolean get() = _fineEraseEnabled.value
 
@@ -218,6 +728,8 @@ class DrawingViewModel(
         if (_currentTool.value == ToolType.ERASER) return
         // 有待确认图形时不激活临时橡皮擦
         if (_pendingEdit.value.isActive()) return
+        // 数字阵列编辑中不激活（避免擦掉组成员破坏整组重建的索引假设）
+        if (_numArrayActive.value) return
         _isTemporaryEraser.value = true
         _previousToolBeforeEraser = _currentTool.value
         // 取消当前正在画的基元
@@ -269,13 +781,33 @@ class DrawingViewModel(
     private var _lastNumberFontSize: Float = 30f
 
     // ─── 选择变换快照 ─────────────────────────────────────
-    private var _selectionSnapshot: Map<Int, DrawingPrimitive>? = null
-    private var _scaleAccumAvg: Float = 1f
+    private data class SelectionTransformState(
+        val snapshot: Map<Int, DrawingPrimitive>,
+        val startRotation: Float,
+        val startScaleX: Float,
+        val startScaleY: Float,
+        val startOffsetX: Float,
+        val startOffsetY: Float
+    )
+    private var _transformState: SelectionTransformState? = null
 
     // ─── 属性对话框 ─────────────────────────────────────
     private val _showPropertiesDlg = mutableStateOf(false)
     val showPropertiesDlg: Boolean get() = _showPropertiesDlg.value
     fun dismissPropertiesDialog() { _showPropertiesDlg.value = false }
+    // Array dialog state (selection array pattern)
+    private val _showArrayDlg = mutableStateOf(false)
+    val showArrayDlg: Boolean get() = _showArrayDlg.value
+    val arrayRows = mutableIntStateOf(2)
+    val arrayCols = mutableIntStateOf(2)
+    val arrayGapX = mutableFloatStateOf(80f)   // horizontal gap between columns
+    val arrayGapY = mutableFloatStateOf(80f)   // vertical gap between rows
+    val arrayDirX = mutableIntStateOf(1)       // 1=right, -1=left
+    val arrayDirY = mutableIntStateOf(1)       // 1=down, -1=up
+    fun dismissArrayDialog() { _showArrayDlg.value = false }
+    // Active array mode (ghost preview + handles visible)
+    private val _arrayActive = mutableStateOf(false)
+    val arrayActive: Boolean get() = _arrayActive.value
 
     private var hasUnsavedChanges = false
     val isDirty: Boolean get() = hasUnsavedChanges
@@ -289,21 +821,152 @@ class DrawingViewModel(
     // ═══════════════════════════════════════════════════════
 
     fun setTool(tool: ToolType) {
-        // 有待确认图形时，不允许切换到其他工具
-        if (_pendingEdit.value.isActive() && tool != _currentTool.value) return
+        // 阵列模式中不允许切换工具
+        if (_arrayActive.value) return
+        // 数字阵列编辑中不允许切换工具
+        if (_numArrayActive.value) return
+        // 有待确认图形(PFO)时：立即取消 PFO/输入，再切换到新工具
+        if (_pendingEdit.value.isActive() && tool != _currentTool.value) {
+            cancelPendingEdit()
+        }
+        // 选择变换中切工具 → 先应用变换再切
+        if (tool != _currentTool.value && _currentTool.value == ToolType.SELECT && _transformState != null) {
+            finalizeSelectionTransform()
+        }
         _previousTool.value = _currentTool.value
         _currentTool.value = tool
         _isTemporaryEraser.value = false  // 手动切工具退出临时模式
-        // 切换工具时清除选择
-        if (tool != ToolType.SELECT && _selection.value.selectedIndices.isNotEmpty()) {
+        // 切换工具时清除选择和残留的变换状态
+        if (tool != ToolType.SELECT) {
             clearSelection()
         }
         saveSettings()
     }
-    fun setColor(color: Color) { _currentColor.value = color; saveSettings() }
-    fun setStrokeWidth(w: Float) { _currentStrokeWidth.value = w.coerceIn(1f, 40f); saveSettings() }
-    fun setLineStyle(style: LineStyle) { _currentLineStyle.value = style; saveSettings() }
-    fun setActiveLayer(id: Int) { _activeLayerId.value = id }
+    /**
+     * 工具栏颜色按钮：PFO(待确认/选择)期间实时作用到图形本身，不写图纸级颜色；
+     * 无 PFO 时才修改图纸级颜色（退出 PFO 后按钮自动恢复显示图纸级颜色）。
+     */
+    fun setColor(color: Color) {
+        // 待确认(PFO)图形：实时跟随
+        val pe = _pendingEdit.value
+        val prim = pe.primitive
+        if (pe.isActive() && prim != null) {
+            _pendingEdit.value = pe.copy(primitive = prim.withColor(color))
+            return
+        }
+        // 选择(PFO)图形：实时调整所有选中图形
+        val sel = _selection.value.selectedIndices
+        if (sel.isNotEmpty()) {
+            pushSelectionAdjustUndo()
+            for (i in sel.sortedDescending()) {
+                val p = _primitives.getOrNull(i) ?: continue
+                _primitives[i] = p.withColor(color)
+            }
+            autoSave()
+            return
+        }
+        _currentColor.value = color
+        saveSettings()
+    }
+    /**
+     * 工具栏线宽滑块：PFO(待确认/选择)期间实时作用到图形本身，不写图纸级线宽；
+     * 无 PFO 时才修改图纸级线宽（退出 PFO 后滑块自动恢复显示图纸级线宽）。
+     */
+    fun setStrokeWidth(w: Float) {
+        val v = w.coerceIn(1f, 40f)
+        // 待确认(PFO)图形：实时跟随
+        val pe = _pendingEdit.value
+        val prim = pe.primitive
+        if (pe.isActive() && prim != null) {
+            val updated = shapeWithStrokeWidth(prim, v)
+            if (updated != null) { _pendingEdit.value = pe.copy(primitive = updated); return }
+        }
+        // 选择(PFO)图形：实时调整所有选中图形
+        val sel = _selection.value.selectedIndices
+        if (sel.isNotEmpty()) {
+            pushSelectionAdjustUndo()
+            var changed = false
+            for (i in sel.sortedDescending()) {
+                val p = _primitives.getOrNull(i) ?: continue
+                val updated = shapeWithStrokeWidth(p, v) ?: continue
+                _primitives[i] = updated; changed = true
+            }
+            if (changed) autoSave()
+            return
+        }
+        _currentStrokeWidth.value = v
+        saveSettings()
+    }
+
+    /** 形状类图形支持线宽；块引用也支持（=块内容整体线宽基准，见 blockLineWidthScale）。数字/文字/区间不跟随 */
+    private fun shapeWithStrokeWidth(p: DrawingPrimitive, w: Float): DrawingPrimitive? = when (p) {
+        is DrawingPrimitive.FreehandPath -> p.copy(strokeWidth = w)
+        is DrawingPrimitive.RectanglePrimitive -> p.copy(strokeWidth = w)
+        is DrawingPrimitive.CirclePrimitive -> p.copy(strokeWidth = w)
+        is DrawingPrimitive.LinePrimitive -> p.copy(strokeWidth = w)
+        is DrawingPrimitive.BlockRefPrimitive -> p.copy(strokeWidth = w)
+        else -> null
+    }
+
+    /** 滑块连续拖动时每次 PFO 会话只压入一次撤销快照（参照橡皮擦的去重模式） */
+    private var selectionAdjustUndoPushed = false
+    private fun pushSelectionAdjustUndo() {
+        if (!selectionAdjustUndoPushed) { pushUndo(); selectionAdjustUndoPushed = true }
+    }
+
+    /** 工具栏线宽滑块的显示值：待确认=该图形线宽；单选=该图形线宽；多选=最宽线宽；否则=图纸级线宽 */
+    val toolbarStrokeWidth: Float
+        get() {
+            val pe = _pendingEdit.value
+            if (pe.isActive()) {
+                when (val p = pe.primitive) {
+                    is DrawingPrimitive.FreehandPath -> return p.strokeWidth
+                    is DrawingPrimitive.RectanglePrimitive -> return p.strokeWidth
+                    is DrawingPrimitive.CirclePrimitive -> return p.strokeWidth
+                    is DrawingPrimitive.LinePrimitive -> return p.strokeWidth
+                    is DrawingPrimitive.BlockRefPrimitive -> return p.strokeWidth
+                    else -> {}
+                }
+            }
+            val sel = _selection.value.selectedIndices
+            if (sel.isNotEmpty()) {
+                var maxW = -1f
+                for (i in sel) {
+                    when (val p = _primitives.getOrNull(i)) {
+                        is DrawingPrimitive.FreehandPath -> maxW = maxOf(maxW, p.strokeWidth)
+                        is DrawingPrimitive.RectanglePrimitive -> maxW = maxOf(maxW, p.strokeWidth)
+                        is DrawingPrimitive.CirclePrimitive -> maxW = maxOf(maxW, p.strokeWidth)
+                        is DrawingPrimitive.LinePrimitive -> maxW = maxOf(maxW, p.strokeWidth)
+                        is DrawingPrimitive.BlockRefPrimitive -> maxW = maxOf(maxW, p.strokeWidth)
+                        else -> {}
+                    }
+                }
+                if (maxW > 0f) return maxW
+            }
+            return _currentStrokeWidth.value
+        }
+
+    /** 工具栏颜色按钮的显示值：待确认=该图形颜色；选择=首个选中图形颜色；否则=图纸级颜色 */
+    val toolbarColor: Color
+        get() {
+            val pe = _pendingEdit.value
+            if (pe.isActive()) pe.primitive?.let { return it.color }
+            val sel = _selection.value.selectedIndices
+            if (sel.isNotEmpty()) {
+                sel.minOrNull()?.let { idx -> _primitives.getOrNull(idx)?.let { return it.color } }
+            }
+            return _currentColor.value
+        }
+    // 只换线型，保留已调好的虚线间隔（dash/gap 由工具栏“比例”旁的面板单独调）
+    fun setLineStyle(style: LineStyle) {
+        _currentLineStyle.value = _currentLineStyle.value.copy(type = style.type)
+        saveSettings()
+    }
+    fun setActiveLayer(id: Int) {
+        val target = _layers.find { it.id == id } ?: return
+        if (!target.isVisible) return  // 隐藏层不能设为活动层，避免盲画/盲擦
+        _activeLayerId.value = id
+    }
     fun setGlobalLineScale(s: Float) { _globalLineScale.value = s.coerceIn(0.25f, 4f); saveSettings() }
     fun setEraserRadius(displayR: Float) { _eraserRadius.value = (displayR * 10f).coerceIn(50f, 1000f); saveSettings() }
     fun toggleConstraint() { _constraintEnabled.value = !_constraintEnabled.value; saveSettings() }
@@ -314,13 +977,28 @@ class DrawingViewModel(
         _numberLabel.value = _numberLabel.value.copy(startFrom = value, currentValue = value)
     }
     fun setNumberFontSize(size: Float) {
-        _numberLabel.value = _numberLabel.value.copy(fontSize = size.coerceIn(30f, 200f))
+        _numberLabel.value = _numberLabel.value.copy(fontSize = size.coerceIn(30f, 600f))
     }
     fun updateNumberLabelValue(newValue: Int) {
         _numberLabel.value = _numberLabel.value.copy(currentValue = newValue)
     }
     fun getLastTextFontSize(): Float = _lastTextFontSize
     fun getLastNumberFontSize(): Float = _lastNumberFontSize
+    /** 文字工具栏字号滑块（无 pending 时）：与缩放钳制一致 30..600 */
+    fun setLastTextFontSize(size: Float) { _lastTextFontSize = size.coerceIn(30f, 600f); saveSettings() }
+
+    // Persisted text orientation
+    private val _textHorizontalOnly = mutableStateOf(false)
+    val textHorizontalOnly: Boolean get() = _textHorizontalOnly.value
+    fun toggleTextOrientation() {
+        _textHorizontalOnly.value = !_textHorizontalOnly.value
+        saveSettings()
+    }
+    /** 文字对话框确定时显式设置方向（true=横向） */
+    fun setTextOrientation(horizontalOnly: Boolean) {
+        _textHorizontalOnly.value = horizontalOnly
+        saveSettings()
+    }
 
     // ─── 区间数字 ─────────────────────────────────────────
     fun setRangeValues(start: Int, end: Int) {
@@ -333,7 +1011,7 @@ class DrawingViewModel(
         _rangeLabel.value = _rangeLabel.value.copy(endValue = value)
     }
     fun setRangeFontSize(size: Float) {
-        _rangeLabel.value = _rangeLabel.value.copy(fontSize = size.coerceIn(20f, 200f))
+        _rangeLabel.value = _rangeLabel.value.copy(fontSize = size.coerceIn(20f, 600f))
     }
     fun toggleRangeOrientation() {
         _rangeLabel.value = _rangeLabel.value.copy(horizontalOnly = !_rangeLabel.value.horizontalOnly)
@@ -345,6 +1023,145 @@ class DrawingViewModel(
             _pendingEdit.value = pe.copy(primitive = p.copy(reversed = !p.reversed))
         }
         _rangeLabel.value = _rangeLabel.value.copy(reversed = !_rangeLabel.value.reversed)
+    }
+    fun setRangeArrowSpan(span: Float) {
+        _rangeLabel.value = _rangeLabel.value.copy(arrowSpan = span)
+        docDefaultArrowSpan = span
+        saveSettings()
+    }
+
+    // ─── 数字阵列 ─────────────────────────────────────────
+    /** 松手后在 [start] 生成整组普通数字并进入编辑模式（创建只推一次撤销快照） */
+    private fun startNumArray(start: Point2D) {
+        val na = _numArrayLabel.value
+        numArrayBaseX = start.x; numArrayBaseY = start.y
+        pushUndo()
+        val first = _primitives.size
+        buildNumArrayPrimitives(na).forEach { _primitives.add(it) }
+        numArrayIndices = (first until _primitives.size).toList()
+        _numArrayActive.value = true
+        hasUnsavedChanges = true
+    }
+
+    /** 按状态构建一组数字基元（竖屏正立、横屏转 90° 保持"朝下"可读，步长 1，start>end 时倒序；沿 rotationDeg 方向排列） */
+    private fun buildNumArrayPrimitives(na: NumArrayLabel): List<DrawingPrimitive.NumberLabelPrimitive> {
+        val step = if (na.endValue >= na.startValue) 1 else -1
+        val count = abs(na.endValue - na.startValue) + 1
+        val rad = Math.toRadians(na.rotationDeg.toDouble())
+        val cosA = kotlin.math.cos(rad).toFloat()
+        val sinA = kotlin.math.sin(rad).toFloat()
+        return (0 until count).map { i ->
+            DrawingPrimitive.NumberLabelPrimitive(
+                value = na.startValue + step * i,
+                x = numArrayBaseX + cosA * na.gap * i, y = numArrayBaseY + sinA * na.gap * i,
+                fontSize = na.fontSize, color = _currentColor.value,
+                strokeWidth = _currentStrokeWidth.value, layerId = _activeLayerId.value,
+                horizontalOnly = true, circled = na.circled,
+                rotation = if (_isLandscape.value) (Math.PI / 2).toFloat() else 0f
+            )
+        }
+    }
+
+    /** 编辑中调整参数：整组删旧建新（索引连续成块，不再推撤销快照） */
+    private fun regenerateNumArray() {
+        if (!_numArrayActive.value || numArrayIndices.isEmpty()) return
+        val first = numArrayIndices.first()
+        repeat(numArrayIndices.size) { _primitives.removeAt(first) }
+        buildNumArrayPrimitives(_numArrayLabel.value).forEach { _primitives.add(it) }
+        numArrayIndices = (first until _primitives.size).toList()
+        hasUnsavedChanges = true
+    }
+
+    fun setNumArrayValues(start: Int, end: Int) {
+        _numArrayLabel.value = _numArrayLabel.value.copy(startValue = start, endValue = end)
+        if (_numArrayActive.value) regenerateNumArray()
+    }
+    fun setNumArrayFontSize(size: Float) {
+        _numArrayLabel.value = _numArrayLabel.value.copy(fontSize = size.coerceIn(20f, 600f))
+        if (_numArrayActive.value) regenerateNumArray()
+    }
+    fun setNumArrayGap(gap: Float) {
+        _numArrayLabel.value = _numArrayLabel.value.copy(gap = gap.coerceIn(20f, 10000f))
+        if (_numArrayActive.value) regenerateNumArray()
+    }
+    /** 竖向排列开关（对话框用）：在 0°（横向）与 90°（竖向）之间切换 */
+    fun toggleNumArrayLayout() {
+        val cur = _numArrayLabel.value.rotationDeg % 180f
+        val newDeg = if (cur < 45f || cur > 135f) 90f else 0f
+        _numArrayLabel.value = _numArrayLabel.value.copy(rotationDeg = newDeg)
+        if (_numArrayActive.value) regenerateNumArray()
+    }
+
+    // ── 首数字拖动（移动整个阵列；正交开启时锁轴） ──
+    private var numArrayDragAxis: Int? = null      // null=未定 / 0=水平 / 1=垂直
+    private var numArrayDragUndoPushed = false
+
+    fun beginNumArrayDrag() {
+        numArrayDragAxis = null
+        numArrayDragUndoPushed = false
+    }
+
+    /** 拖动首数字：世界增量平移阵列基点（正交开启时锁定主轴；连续拖动合并为一次 undo、延迟保存） */
+    fun moveNumArray(dx: Float, dy: Float) {
+        if (!_numArrayActive.value) return
+        var ddx = dx; var ddy = dy
+        if (_orthoMode.value) {
+            if (numArrayDragAxis == null && (dx != 0f || dy != 0f)) {
+                numArrayDragAxis = if (abs(dx) >= abs(dy)) 0 else 1
+            }
+            when (numArrayDragAxis) {
+                0 -> ddy = 0f
+                1 -> ddx = 0f
+            }
+        }
+        if (ddx == 0f && ddy == 0f) return
+        if (!numArrayDragUndoPushed) { pushUndo(); numArrayDragUndoPushed = true }
+        numArrayBaseX += ddx
+        numArrayBaseY += ddy
+        regenerateNumArray()
+        _sliderSaveJob?.cancel()
+        _sliderSaveJob = viewModelScope.launch {
+            kotlinx.coroutines.delay(700L)
+            autoSave()
+        }
+    }
+
+    fun endNumArrayDrag() {
+        numArrayDragAxis = null
+    }
+
+    /** 方向手柄拖动：以首数字为圆心 360° 旋转（正交开启时吸附 45° 档），角度实时写入排列方向 */
+    fun setNumArrayRotation(deg: Float) {
+        var norm = ((deg % 360f) + 360f) % 360f
+        if (_orthoMode.value) norm = (Math.round(norm / 45f) * 45f) % 360f
+        if (abs(_numArrayLabel.value.rotationDeg - norm) < 0.5f) return
+        _numArrayLabel.value = _numArrayLabel.value.copy(rotationDeg = norm)
+        if (_numArrayActive.value) regenerateNumArray()
+    }
+    fun toggleNumArrayCircled() {
+        _numArrayLabel.value = _numArrayLabel.value.copy(circled = !_numArrayLabel.value.circled)
+        if (_numArrayActive.value) regenerateNumArray()
+    }
+
+    /** 确认：整组数字定稿为普通数字；首数字自动递增方便连续放下一组 */
+    fun confirmNumArray() {
+        if (!_numArrayActive.value) return
+        val na = _numArrayLabel.value
+        val span = na.endValue - na.startValue
+        val newStart = na.endValue + (if (span >= 0) 1 else -1)
+        _numArrayLabel.value = na.copy(startValue = newStart, endValue = newStart + span)
+        _numArrayActive.value = false
+        numArrayIndices = emptyList()
+        saveSettings()
+        autoSave()
+    }
+
+    /** 取消：回滚创建时的撤销快照，一次撤掉整组 */
+    fun cancelNumArray() {
+        if (!_numArrayActive.value) return
+        _numArrayActive.value = false
+        numArrayIndices = emptyList()
+        undo()
     }
 
     fun toggleHorizontalText() {
@@ -358,6 +1175,7 @@ class DrawingViewModel(
                     _pendingEdit.value = pe.copy(
                         primitive = prim.copy(horizontalOnly = newHoriz, rotation = newRot),
                         bounds = swapBounds(pe.bounds))
+                    _textHorizontalOnly.value = newHoriz
                 }
                 is DrawingPrimitive.NumberLabelPrimitive -> {
                     val newHoriz = !prim.horizontalOnly
@@ -365,6 +1183,7 @@ class DrawingViewModel(
                     _pendingEdit.value = pe.copy(
                         primitive = prim.copy(horizontalOnly = newHoriz, rotation = newRot),
                         bounds = swapBounds(pe.bounds))
+                    _numberLabel.value = _numberLabel.value.copy(horizontalOnly = newHoriz)
                 }
                 is DrawingPrimitive.RangeLabelPrimitive -> {
                     val newHoriz = !prim.horizontalOnly
@@ -372,17 +1191,34 @@ class DrawingViewModel(
                     _pendingEdit.value = pe.copy(
                         primitive = prim.copy(horizontalOnly = newHoriz, rotation = newRot),
                         bounds = swapBounds(pe.bounds))
+                    _rangeLabel.value = _rangeLabel.value.copy(horizontalOnly = newHoriz)
                 }
                 else -> {}
             }
         } else {
-            if (_currentTool.value == ToolType.RANGE) {
-                val newValue = !_rangeLabel.value.horizontalOnly
-                _rangeLabel.value = _rangeLabel.value.copy(horizontalOnly = newValue)
-            } else {
-                val newValue = !_numberLabel.value.horizontalOnly
-                _numberLabel.value = _numberLabel.value.copy(horizontalOnly = newValue)
+            when (_currentTool.value) {
+                ToolType.RANGE ->
+                    _rangeLabel.value = _rangeLabel.value.copy(horizontalOnly = !_rangeLabel.value.horizontalOnly)
+                ToolType.TEXT -> {
+                    _textHorizontalOnly.value = !_textHorizontalOnly.value
+                    saveSettings()
+                }
+                else ->
+                    _numberLabel.value = _numberLabel.value.copy(horizontalOnly = !_numberLabel.value.horizontalOnly)
             }
+        }
+    }
+
+    /** 数字外圈开关：pending 激活时同步刷新预览和工具状态 */
+    fun toggleNumberCircled() {
+        val pe = _pendingEdit.value
+        val prim = pe.primitive
+        if (pe.isActive() && prim is DrawingPrimitive.NumberLabelPrimitive) {
+            val newCircled = !prim.circled
+            _pendingEdit.value = pe.copy(primitive = prim.copy(circled = newCircled))
+            _numberLabel.value = _numberLabel.value.copy(circled = newCircled)
+        } else {
+            _numberLabel.value = _numberLabel.value.copy(circled = !_numberLabel.value.circled)
         }
     }
 
@@ -402,7 +1238,8 @@ class DrawingViewModel(
 
     fun transformCanvas(zoom: Float, centroid: Offset, pan: Offset) {
         val oldScale = _canvasScale.value
-        val newScale = (oldScale * zoom).coerceIn(0.05f, 50f)
+        if (oldScale <= 0f) return
+        val newScale = (oldScale * zoom).coerceIn(0.015f, 50f)
         if (zoom != 1f) {
             val ratio = newScale / oldScale
             _canvasOffsetX.value = centroid.x - (centroid.x - _canvasOffsetX.value) * ratio
@@ -413,6 +1250,20 @@ class DrawingViewModel(
         _canvasScale.value = newScale
     }
 
+    fun transformBlockEditorCanvas(zoom: Float, centroid: Offset, pan: Offset) {
+        val oldScale = _blockEditorViewScale.value
+        if (oldScale <= 0f) return
+        val newScale = (oldScale * zoom).coerceIn(0.015f, 50f)
+        if (zoom != 1f) {
+            val ratio = newScale / oldScale
+            _blockEditorViewX.value = centroid.x - (centroid.x - _blockEditorViewX.value) * ratio
+            _blockEditorViewY.value = centroid.y - (centroid.y - _blockEditorViewY.value) * ratio
+        }
+        _blockEditorViewX.value += pan.x
+        _blockEditorViewY.value += pan.y
+        _blockEditorViewScale.value = newScale
+    }
+
     fun fitToScreen(screenWidth: Float, screenHeight: Float) {
         if (_primitives.isEmpty() && _pendingEdit.value.primitive == null) {
             _canvasScale.value = 1f; _canvasOffsetX.value = 0f; _canvasOffsetY.value = 0f; return
@@ -421,12 +1272,12 @@ class DrawingViewModel(
         var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE
         var maxX = -Float.MAX_VALUE; var maxY = -Float.MAX_VALUE
         for (p in allPrimitives) {
-            val b = computeBounds(p) ?: continue
+            val b = p.computeBounds(boundsMeasurePaint) ?: continue
             minX = minOf(minX, b[0], b[2]); minY = minOf(minY, b[1], b[3])
             maxX = maxOf(maxX, b[0], b[2]); maxY = maxOf(maxY, b[1], b[3])
         }
         _pendingEdit.value.primitive?.let { p ->
-            val b = computeBounds(p) ?: return@let
+            val b = p.computeBounds(boundsMeasurePaint) ?: return@let
             minX = minOf(minX, b[0], b[2]); minY = minOf(minY, b[1], b[3])
             maxX = maxOf(maxX, b[0], b[2]); maxY = maxOf(maxY, b[1], b[3])
         }
@@ -442,140 +1293,38 @@ class DrawingViewModel(
         _canvasScale.value = ns; _canvasOffsetX.value = scx - cx * ns; _canvasOffsetY.value = scy - cy * ns
     }
 
-    private fun computeBounds(p: DrawingPrimitive): FloatArray? {
-        return when (p) {
-            is DrawingPrimitive.FreehandPath -> {
-                if (p.points.size < 2) return null
-            val xs = p.points.map { it.x }; val ys = p.points.map { it.y }
-            floatArrayOf(xs.min(), ys.min(), xs.max(), ys.max())
-        }
-        is DrawingPrimitive.RectanglePrimitive -> {
-            val left = minOf(p.startX, p.endX); val top = minOf(p.startY, p.endY)
-            val right = maxOf(p.startX, p.endX); val bottom = maxOf(p.startY, p.endY)
-            if (kotlin.math.abs(p.rotation) < 0.001f) {
-                floatArrayOf(left, top, right, bottom)
-            } else {
-                val cx = (left + right) / 2f; val cy = (top + bottom) / 2f
-                val hw = (right - left) / 2f; val hh = (bottom - top) / 2f
-                val cosR = kotlin.math.cos(p.rotation); val sinR = kotlin.math.sin(p.rotation)
-                fun rot(wx: Float, wy: Float): Point2D {
-                    val dx = wx - cx; val dy = wy - cy
-                    return Point2D(cx + dx * cosR - dy * sinR, cy + dx * sinR + dy * cosR)
-                }
-                val pts = listOf(rot(cx - hw, cy - hh), rot(cx + hw, cy - hh),
-                    rot(cx + hw, cy + hh), rot(cx - hw, cy + hh))
-                val xs = pts.map { it.x }; val ys = pts.map { it.y }
-                floatArrayOf(xs.min(), ys.min(), xs.max(), ys.max())
-            }
-        }
-        is DrawingPrimitive.CirclePrimitive -> {
-            val r = maxOf(abs(p.endX - p.centerX), abs(p.endY - p.centerY))
-            floatArrayOf(p.centerX - r, p.centerY - r, p.centerX + r, p.centerY + r)
-        }
-        is DrawingPrimitive.LinePrimitive -> {
-            val xs = listOf(p.startX, p.endX); val ys = listOf(p.startY, p.endY)
-            val pad = p.strokeWidth / 2f + 10f
-            floatArrayOf(xs.min() - pad, ys.min() - pad, xs.max() + pad, ys.max() + pad)
-        }
-        is DrawingPrimitive.NumberLabelPrimitive -> {
-            val paint = Paint().apply {
-                textSize = p.fontSize * 1.3f * globalLineScale * p.lineScaleFactor
-                typeface = Typeface.DEFAULT_BOLD
-                isAntiAlias = true
-                textAlign = Paint.Align.CENTER
-            }
-            val textWidth = paint.measureText(p.value.toString())
-            val fm = paint.fontMetrics
-            val hw = textWidth / 2f
-            val hh = (fm.descent - fm.ascent) / 2f
-            floatArrayOf(p.x - hw, p.y - hh, p.x + hw, p.y + hh)
-        }
-        is DrawingPrimitive.TextPrimitive -> {
-            val paint = Paint().apply {
-                textSize = p.fontSize * 1.3f * globalLineScale * p.lineScaleFactor
-                typeface = Typeface.DEFAULT_BOLD
-                isAntiAlias = true
-                textAlign = Paint.Align.CENTER
-            }
-            val textWidth = paint.measureText(p.text)
-            val fm = paint.fontMetrics
-            val hw = textWidth / 2f
-            val hh = (fm.descent - fm.ascent) / 2f
-            floatArrayOf(p.x - hw, p.y - hh, p.x + hw, p.y + hh)
-        }
-        is DrawingPrimitive.RangeLabelPrimitive -> {
-            val arrowLen = maxOf(80f * p.arrowSpan, 20f)
-            val paint = Paint().apply {
-                textSize = p.fontSize * 1.3f * globalLineScale * p.lineScaleFactor
-                typeface = Typeface.DEFAULT_BOLD
-                isAntiAlias = true
-                textAlign = Paint.Align.CENTER
-            }
-            val w1 = paint.measureText(p.startValue.toString())
-            val w2 = paint.measureText(p.endValue.toString())
-            val gap = p.fontSize
-            val totalW = w1 + w2 + arrowLen + gap * 2f
-            val halfW = totalW / 2f
-            val fm = paint.fontMetrics
-            val halfH = (fm.descent - fm.ascent) / 2f
-            if (kotlin.math.abs(p.rotation) > 0.001f && !p.horizontalOnly) {
-                // Vertical mode: swap width and height
-                floatArrayOf(p.x - halfH, p.y - halfW, p.x + halfH, p.y + halfW)
-            } else {
-                floatArrayOf(p.x - halfW, p.y - halfH, p.x + halfW, p.y + halfH)
-            }
-        }
-        is DrawingPrimitive.BlockRefPrimitive -> {
-            val h = 50f * p.scale
-            floatArrayOf(p.x - h, p.y - h, p.x + h, p.y + h)
-        }
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════
-    //  绘图操作
     // ═══════════════════════════════════════════════════════
 
     fun startPrimitive(start: Point2D) {
         val activeLayer = _layers.find { it.id == _activeLayerId.value }
         if (activeLayer?.isLocked == true) return
+        // 阵列预览中：单指拖动 = 平移原始元素（幽灵预览跟随）
+        if (_arrayActive.value) {
+            if (_selection.value.selectedIndices.isNotEmpty()) {
+                arrayDragLast = start
+                arrayDragUndoPushed = false  // 撤销延迟到首次实际移动时再记，避免点按/手柄按下产生空撤销
+            }
+            return
+        }
+        if (placePendingImport(start)) return
+        // 数字阵列编辑中：单指不做事（间距由手柄调，其余由实时工具栏调）
+        if (_numArrayActive.value) return
+        // 图片管理模式中：单指不做事（画布仅双指平移缩放 + PFO 手柄，图片不可点选）
+        if (_imageManageActive.value) return
         if (_pendingEdit.value.isActive()) return
 
         when (_currentTool.value) {
-            ToolType.ERASER -> { performErasure(start); return }
+            ToolType.ERASER -> {
+                // 只记落下点并显示橡皮光标，不立即擦除（见 eraserDownPoint 注释）
+                eraserDownPoint = start
+                _eraserTouchPoint.value = start
+                return
+            }
             ToolType.SELECT -> { startSelection(start); return }
-            ToolType.ANNOTATE -> {
-                val nl = _numberLabel.value
-                val initRotation = if (nl.horizontalOnly) 0f else (Math.PI / 2).toFloat()
-                _currentPrimitive.value = DrawingPrimitive.NumberLabelPrimitive(
-                    value = nl.currentValue, x = start.x, y = start.y,
-                    fontSize = nl.fontSize, color = _currentColor.value,
-                    strokeWidth = _currentStrokeWidth.value, layerId = _activeLayerId.value,
-                    horizontalOnly = nl.horizontalOnly, rotation = initRotation
-                )
-                return
-            }
-            ToolType.TEXT -> {
-                val txt = _pendingTextContent.value.ifBlank { "文本" }
-                _currentPrimitive.value = DrawingPrimitive.TextPrimitive(
-                    text = txt, x = start.x, y = start.y,
-                    fontSize = _lastTextFontSize, color = _currentColor.value,
-                    strokeWidth = _currentStrokeWidth.value, layerId = _activeLayerId.value,
-                    horizontalOnly = false, rotation = (Math.PI / 2).toFloat()
-                )
-                return
-            }
-            ToolType.RANGE -> {
-                val rl = _rangeLabel.value
-                val initRotation = if (rl.horizontalOnly) 0f else (Math.PI / 2).toFloat()
-                _currentPrimitive.value = DrawingPrimitive.RangeLabelPrimitive(
-                    startValue = rl.startValue, endValue = rl.endValue,
-                    x = start.x, y = start.y,
-                    fontSize = rl.fontSize, color = _currentColor.value,
-                    strokeWidth = _currentStrokeWidth.value, layerId = _activeLayerId.value,
-                    horizontalOnly = rl.horizontalOnly, rotation = initRotation,
-                    arrowSpan = 1f, reversed = rl.reversed
-                )
+            ToolType.ANNOTATE, ToolType.TEXT, ToolType.RANGE, ToolType.NUM_ARRAY -> {
+                // 只记位置，松手（commitPrimitive）才创建；双指缩放时 cancelPrimitive 清掉，
+                // 全程不产生预览，避免缩放手势第一触点闪现数字/文字
+                labelPendingStart = start
                 return
             }
             ToolType.BLOCK -> { clearSelection(); return }
@@ -589,7 +1338,8 @@ class DrawingViewModel(
                 lineStyle = _currentLineStyle.value
             )
             ToolType.RECTANGLE -> DrawingPrimitive.RectanglePrimitive(
-                startX = start.x, startY = start.y, endX = start.x, endY = start.y,
+                corners = listOf(Point2D(start.x, start.y), Point2D(start.x, start.y),
+                    Point2D(start.x, start.y), Point2D(start.x, start.y)),
                 color = _currentColor.value, strokeWidth = _currentStrokeWidth.value,
                 layerId = _activeLayerId.value, lineStyle = _currentLineStyle.value
             )
@@ -607,20 +1357,83 @@ class DrawingViewModel(
         }
     }
 
+    /** 按当前工具在指定位置创建数字/文字/区间基元（松手时才调用，见 labelPendingStart） */
+    private fun buildLabelPrimitive(start: Point2D): DrawingPrimitive? = when (_currentTool.value) {
+        ToolType.ANNOTATE -> {
+            val nl = _numberLabel.value
+            val initRotation = if (nl.horizontalOnly) 0f else (Math.PI / 2).toFloat()
+            DrawingPrimitive.NumberLabelPrimitive(
+                value = nl.currentValue, x = start.x, y = start.y,
+                fontSize = nl.fontSize, color = _currentColor.value,
+                strokeWidth = _currentStrokeWidth.value, layerId = _activeLayerId.value,
+                horizontalOnly = nl.horizontalOnly, circled = nl.circled, rotation = initRotation
+            )
+        }
+        ToolType.TEXT -> {
+            val txt = _pendingTextContent.value.ifBlank { "文本" }
+            val textHoriz = _textHorizontalOnly.value
+            DrawingPrimitive.TextPrimitive(
+                text = txt, x = start.x, y = start.y,
+                fontSize = _lastTextFontSize, color = _currentColor.value,
+                strokeWidth = _currentStrokeWidth.value, layerId = _activeLayerId.value,
+                horizontalOnly = textHoriz, rotation = if (textHoriz) 0f else (Math.PI / 2).toFloat()
+            )
+        }
+        ToolType.RANGE -> {
+            val rl = _rangeLabel.value
+            // 布局旋转角只表达"横向/竖向"（0 / π/2），横屏偏移由渲染/导出期的纯函数
+            // RangeLabelLayout 统一叠加（两端数字"朝下"跟随画布旋转态），不再烘焙进存储值，
+            // 这样横竖屏切换时已存在的区间也能跟随。
+            val initRotation = if (rl.horizontalOnly) 0f else (Math.PI / 2).toFloat()
+            DrawingPrimitive.RangeLabelPrimitive(
+                startValue = rl.startValue, endValue = rl.endValue,
+                x = start.x, y = start.y,
+                fontSize = rl.fontSize, color = _currentColor.value,
+                strokeWidth = _currentStrokeWidth.value, layerId = _activeLayerId.value,
+                horizontalOnly = rl.horizontalOnly, rotation = initRotation,
+                arrowSpan = docDefaultArrowSpan, reversed = rl.reversed,
+                numbersFaceLeft = rl.numbersFaceLeft
+            )
+        }
+        else -> null
+    }
+
     fun updatePrimitive(point: Point2D) {
-        if (_currentTool.value == ToolType.ERASER) { performErasure(point); return }
+        // 阵列预览中拖动：平移原始元素
+        val adl = arrayDragLast
+        if (_arrayActive.value && adl != null) {
+            val dx = point.x - adl.x; val dy = point.y - adl.y
+            arrayDragLast = point
+            if (dx != 0f || dy != 0f) {
+                if (!arrayDragUndoPushed) { pushUndo(); arrayDragUndoPushed = true }
+                arrayDragSelected(dx, dy)
+            }
+            return
+        }
+        if (_currentTool.value == ToolType.ERASER) {
+            // 首次移动先补擦落下点，避免起点处漏擦
+            eraserDownPoint?.let { performErasure(it); eraserDownPoint = null }
+            performErasure(point); return
+        }
         if (_currentTool.value == ToolType.SELECT) { updateSelection(point); return }
         _currentPrimitive.value = when (val cp = _currentPrimitive.value) {
             is DrawingPrimitive.FreehandPath -> cp.copy(points = cp.points + point)
             is DrawingPrimitive.RectanglePrimitive -> {
+                val sx = cp.corners[0].x; val sy = cp.corners[0].y
                 if (_rectangleSquareMode.value) {
-                    val dx = point.x - cp.startX
-                    val dy = point.y - cp.startY
+                    val dx = point.x - sx; val dy = point.y - sy
                     val side = maxOf(abs(dx), abs(dy))
-                    val sx = if (dx > 0) 1f else if (dx < 0) -1f else 0f
-                    val sy = if (dy > 0) 1f else if (dy < 0) -1f else 0f
-                    cp.copy(endX = cp.startX + sx * side, endY = cp.startY + sy * side)
-                } else cp.copy(endX = point.x, endY = point.y)
+                    val sgnX = if (dx > 0) 1f else if (dx < 0) -1f else 0f
+                    val sgnY = if (dy > 0) 1f else if (dy < 0) -1f else 0f
+                    val ex = sx + sgnX * side; val ey = sy + sgnY * side
+                    cp.copy(corners = listOf(
+                        Point2D(sx, sy), Point2D(ex, sy),
+                        Point2D(ex, ey), Point2D(sx, ey)
+                    ))
+                } else cp.copy(corners = listOf(
+                    Point2D(sx, sy), Point2D(point.x, sy),
+                    Point2D(point.x, point.y), Point2D(sx, point.y))
+                )
             }
             is DrawingPrimitive.CirclePrimitive -> {
                 if (_circleCircleMode.value) {
@@ -648,34 +1461,53 @@ class DrawingViewModel(
     }
 
     fun commitPrimitive() {
+        arrayDragLast = null
         if (_currentTool.value == ToolType.SELECT) { endSelection(); return }
-        if (_currentTool.value == ToolType.ERASER) { _eraserTouchPoint.value = null; _eraserUndoPushed = false; exitTemporaryEraser(); return }
+        if (_currentTool.value == ToolType.ERASER) {
+            // 点按（全程未移动）：在落下点补一次擦除
+            eraserDownPoint?.let { performErasure(it); eraserDownPoint = null }
+            _eraserTouchPoint.value = null
+            // 什么都没擦掉时不存盘，避免空点一次就整档序列化写盘
+            if (_eraserUndoPushed) autoSave()
+            _eraserUndoPushed = false
+            exitTemporaryEraser(); return
+        }
+        // 数字/文字/区间：松手时才真正创建基元（按下只记了位置）
+        if (_currentPrimitive.value == null && labelPendingStart != null) {
+            val st = labelPendingStart!!
+            labelPendingStart = null
+            // 数字阵列：直接生成整组普通数字，进入专属编辑模式（不进 PendingEdit）
+            if (_currentTool.value == ToolType.NUM_ARRAY) { startNumArray(st); return }
+            _currentPrimitive.value = buildLabelPrimitive(st)
+        }
         val cp = _currentPrimitive.value ?: return
         val valid = when (cp) {
             is DrawingPrimitive.FreehandPath -> cp.points.size >= 3
-            is DrawingPrimitive.RectanglePrimitive -> abs(cp.endX - cp.startX) > 5f || abs(cp.endY - cp.startY) > 5f
-            is DrawingPrimitive.CirclePrimitive -> abs(cp.endX - cp.centerX) > 5f && abs(cp.endY - cp.centerY) > 5f
+            is DrawingPrimitive.RectanglePrimitive -> cp.corners.map { it.x }.let { xs -> xs.max() - xs.min() > 5f } ||
+                cp.corners.map { it.y }.let { ys -> ys.max() - ys.min() > 5f }
+            is DrawingPrimitive.CirclePrimitive -> cp.radiusX > 5f || cp.radiusY > 5f
             is DrawingPrimitive.LinePrimitive -> abs(cp.endX - cp.startX) > 3f || abs(cp.endY - cp.startY) > 3f
             else -> true
         }
         if (valid) {
-            if (_blockDraft.value != null) {
-                _blockDraft.value!!.primitives.add(cp)
-            }
             // 手绘线直接提交，不进预览编辑模式
             if (cp is DrawingPrimitive.FreehandPath) {
+                if (_blockDraft.value != null) {
+                    _blockDraft.value!!.primitives.add(cp)
+                }
                 pushUndo()
                 _primitives.add(cp); hasUnsavedChanges = true
             } else {
-                // 其他图形进入预览编辑模式
-                val arr = computeBounds(cp)
+                // 其他图形进入预览编辑模式（blockDraft 在 confirmPendingEdit 中添加）
+                val arr = cp.computeBounds(boundsMeasurePaint)
                 val bounds = if (arr != null) Bounds(arr[0], arr[1], arr[2], arr[3]) else Bounds(0f, 0f, 100f, 100f)
                 _pendingEdit.value = PendingEdit(
                     active = true, primitive = cp, bounds = bounds,
                     rotation = 0f, scaleX = 1f, scaleY = 1f,
-                    offsetX = 0f, offsetY = 0f
+                    offsetX = 0f, offsetY = 0f,
+                    pivotX = (bounds.minX + bounds.maxX) / 2f,
+                    pivotY = (bounds.minY + bounds.maxY) / 2f
                 )
-                pushUndo()
                 hasUnsavedChanges = true
             }
         }
@@ -683,12 +1515,28 @@ class DrawingViewModel(
     }
 
     fun cancelPrimitive() {
-        if (_currentTool.value == ToolType.SELECT) { clearSelection(); return }
-        if (_currentTool.value == ToolType.ERASER) { _eraserTouchPoint.value = null; _eraserUndoPushed = false; exitTemporaryEraser(); return }
-        // 双指缩放触发 onTouchCancel → 自动取消标注/文字的 PendingEdit
+        // 数字阵列编辑中：双指缩放等打断不影响已生成的整组数字
+        if (_numArrayActive.value) return
+        // Selection persists until explicit deselect — no auto-clear on cancel
+        labelPendingStart = null  // 双指缩放等打断：丢弃未创建的数字/文字/区间
+        if (_currentTool.value == ToolType.ERASER) {
+            eraserDownPoint = null
+            _eraserTouchPoint.value = null
+            // 双指缩放等打断场景：回滚本次手势已擦除的内容，避免误擦；
+            // 什么都没擦掉时跳过撤销与存盘（否则每次双指缩放都要整档序列化写盘，导致卡顿）
+            if (_eraserUndoPushed) {
+                undo()
+                autoSave()
+            }
+            _eraserUndoPushed = false
+            exitTemporaryEraser()
+            return
+        }
+        // Only clear pending edit if it was NOT just created by commitPrimitive
+        // (commitPrimitive creates PendingEdit, cancelPrimitive should not undo it)
         if (_pendingEdit.value.isActive() &&
             (_currentTool.value == ToolType.ANNOTATE || _currentTool.value == ToolType.TEXT || _currentTool.value == ToolType.RANGE)) {
-            _pendingEdit.value = PendingEdit()
+            // Don't clear here — let user interact with the preview
             return
         }
         _currentPrimitive.value = null
@@ -702,7 +1550,10 @@ class DrawingViewModel(
         val pe = _pendingEdit.value
         if (!pe.isActive()) return
         val primitive = pe.primitive ?: return
-        var finalPrimitive = applyTransform(primitive, pe)
+        var finalPrimitive = primitive.applyTransform(pe)
+        if (_blockDraft.value != null) {
+            _blockDraft.value!!.primitives.add(finalPrimitive)
+        }
         pushUndo()
         _primitives.add(finalPrimitive)
         _pendingEdit.value = PendingEdit()
@@ -711,7 +1562,9 @@ class DrawingViewModel(
             is DrawingPrimitive.NumberLabelPrimitive -> {
                 _lastNumberFontSize = finalPrimitive.fontSize
                 _numberLabel.value = _numberLabel.value.copy(fontSize = finalPrimitive.fontSize,
-                    currentValue = _numberLabel.value.currentValue + 1)
+                    currentValue = _numberLabel.value.currentValue + 1,
+                    horizontalOnly = finalPrimitive.horizontalOnly,
+                    circled = finalPrimitive.circled)
             }
             is DrawingPrimitive.RangeLabelPrimitive -> {
                 val newStart = finalPrimitive.endValue + 1
@@ -721,44 +1574,115 @@ class DrawingViewModel(
                     lastEndValue = finalPrimitive.endValue,
                     fontSize = finalPrimitive.fontSize,
                     horizontalOnly = finalPrimitive.horizontalOnly,
-                    reversed = finalPrimitive.reversed)
+                    reversed = finalPrimitive.reversed,
+                    arrowSpan = finalPrimitive.arrowSpan)
+                // 箭线长度是图纸级变量：确认放置时同步默认值，
+                // 保证新建区间数字复用、且随图纸文件保存（buildDocument → defaultArrowSpan）
+                docDefaultArrowSpan = finalPrimitive.arrowSpan
             }
             else -> {}
         }
+        // 图块插入确认后直接选中并切到选择工具（与 DXF 导入主画布行为一致），便于立即移动/缩放
+        if (finalPrimitive is DrawingPrimitive.BlockRefPrimitive) {
+            val idx = setOf(_primitives.size - 1)
+            _selection.value = SelectionState(
+                selectedIndices = idx,
+                bounds = computeSelectionBounds(idx),
+                rotation = computeSelectionRotation(idx)
+            )
+            setTool(ToolType.SELECT)
+        }
+        // 正交移动会话状态复位（待确认结束，防与后续手势串扰）
+        _orthoPe.axis = -1; _orthoPe.accX = 0f; _orthoPe.accY = 0f
         autoSave()
     }
 
-    fun cancelPendingEdit() { _pendingEdit.value = PendingEdit() }
-
-    fun updatePendingOffset(dx: Float, dy: Float) {
-        val pe = _pendingEdit.value
-        _pendingEdit.value = pe.copy(offsetX = pe.offsetX + dx, offsetY = pe.offsetY + dy)
+    fun cancelPendingEdit() {
+        _pendingEdit.value = PendingEdit()
+        _orthoPe.axis = -1; _orthoPe.accX = 0f; _orthoPe.accY = 0f
     }
 
-    fun updatePendingRotation(r: Float) {
-        _pendingEdit.value = _pendingEdit.value.copy(rotation = r)
+    fun updatePendingOffset(dx: Float, dy: Float) {
+        val (mDx, mDy) = applyOrthoConstraint(dx, dy, pe = true)
+        val pe = _pendingEdit.value
+        _pendingEdit.value = pe.copy(offsetX = pe.offsetX + mDx, offsetY = pe.offsetY + mDy)
+    }
+
+    fun updatePendingPrimitive(primitive: DrawingPrimitive) {
+        val pe = _pendingEdit.value
+        val b = primitive.computeBounds(boundsMeasurePaint)
+        val bounds = if (b != null) Bounds(b[0], b[1], b[2], b[3]) else pe.bounds ?: Bounds(0f, 0f, 100f, 100f)
+        _pendingEdit.value = pe.copy(primitive = primitive, bounds = bounds)
+    }
+
+    /** 矩形中点拖拽更新 — 保持 bounds 中心不变，防止旋转后旋转中心漂移导致对边移位 */
+    fun updatePendingRectMidpoint(primitive: DrawingPrimitive) {
+        val pe = _pendingEdit.value
+        val oldBounds = pe.bounds ?: return
+        val oldCx = (oldBounds.minX + oldBounds.maxX) / 2f
+        val oldCy = (oldBounds.minY + oldBounds.maxY) / 2f
+        val b = primitive.computeBounds(boundsMeasurePaint) ?: return
+        val newHw = (b[2] - b[0]) / 2f
+        val newHh = (b[3] - b[1]) / 2f
+        val bounds = Bounds(oldCx - newHw, oldCy - newHh, oldCx + newHw, oldCy + newHh)
+        _pendingEdit.value = pe.copy(primitive = primitive, bounds = bounds)
+    }
+
+    fun updatePendingRotation(delta: Float) {
+        if (_orthoMode.value) {
+            // 正交：旋转吸附 45° 档（seed 校验同上：余量保留 / 切换对齐）
+            val cur = _pendingEdit.value.rotation
+            val fr = _orthoPeFreeRot
+            if (fr == null || Math.abs(Math.round(fr / 45f) * 45f - cur) > 1f) {
+                _orthoPeFreeRot = cur
+            }
+            val free = (_orthoPeFreeRot ?: cur) + delta
+            _orthoPeFreeRot = free
+            _pendingEdit.value = _pendingEdit.value.copy(rotation = Math.round(free / 45f) * 45f)
+        } else {
+            _orthoPeFreeRot = null
+            _pendingEdit.value = _pendingEdit.value.copy(rotation = _pendingEdit.value.rotation + delta)
+        }
+    }
+
+    /** 正交步进旋转（待确认态）：精确 ±90°，不走 45° 吸附；落盘由确认时统一提交。 */
+    fun stepRotatePending(delta: Float) {
+        val pe = _pendingEdit.value
+        if (!pe.isActive()) return
+        _orthoPeFreeRot = null
+        _pendingEdit.value = pe.copy(rotation = pe.rotation + delta)
     }
 
     fun updatePendingScale(sx: Float, sy: Float) {
         val pe = _pendingEdit.value
-        var newScaleX = (pe.scaleX * sx).coerceIn(0.1f, 10f)
-        var newScaleY = (pe.scaleY * sy).coerceIn(0.1f, 10f)
+        var newScaleX = pe.scaleX * sx
+        var newScaleY = pe.scaleY * sy
         val p = pe.primitive
-        if (p is DrawingPrimitive.TextPrimitive || p is DrawingPrimitive.NumberLabelPrimitive) {
+        // 文字/数字/区间：缩放范围直接对齐字号范围（与字号滑块一致）。
+        // 不能用通用 0.1..10 钳制 —— 基础字号 40 时到不了 600(=滑块100级)，
+        // 基础字号大时到不了 30/20(=滑块1级)，且与滑块设置的大 scale 互相打架（卡死/跳变）
+        val fontLimits: Pair<Float, Float>? = when (p) {
+            is DrawingPrimitive.TextPrimitive -> 30f to 600f
+            is DrawingPrimitive.NumberLabelPrimitive -> 30f to 600f
+            is DrawingPrimitive.RangeLabelPrimitive -> 20f to 600f
+            else -> null
+        }
+        if (fontLimits != null) {
             val baseFontSize = when (p) {
                 is DrawingPrimitive.TextPrimitive -> p.fontSize
                 is DrawingPrimitive.NumberLabelPrimitive -> p.fontSize
+                is DrawingPrimitive.RangeLabelPrimitive -> p.fontSize
                 else -> 1f
             }
             if (baseFontSize > 0f) {
-                val maxAvgScale = (600f / baseFontSize).coerceAtMost(10f)
-                val avgScale = sqrt(abs(newScaleX * newScaleY))
-                if (avgScale > maxAvgScale) {
-                    val ratio = maxAvgScale / avgScale
-                    newScaleX = (newScaleX * ratio).coerceIn(0.1f, 10f)
-                    newScaleY = (newScaleY * ratio).coerceIn(0.1f, 10f)
-                }
+                val minS = fontLimits.first / baseFontSize
+                val maxS = fontLimits.second / baseFontSize
+                newScaleX = newScaleX.coerceIn(minS, maxS)
+                newScaleY = newScaleY.coerceIn(minS, maxS)
             }
+        } else {
+            newScaleX = newScaleX.coerceIn(0.1f, 10f)
+            newScaleY = newScaleY.coerceIn(0.1f, 10f)
         }
         _pendingEdit.value = pe.copy(
             scaleX = newScaleX,
@@ -770,7 +1694,7 @@ class DrawingViewModel(
         val pe = _pendingEdit.value
         if (pe.primitive is DrawingPrimitive.RangeLabelPrimitive) {
             val p = pe.primitive as DrawingPrimitive.RangeLabelPrimitive
-            val newFs = (p.fontSize + delta).coerceIn(20f, 200f)
+            val newFs = (p.fontSize + delta).coerceIn(20f, 600f)
             _pendingEdit.value = pe.copy(primitive = p.copy(fontSize = newFs))
         } else {
             val factor = 1f + delta / 50f
@@ -787,7 +1711,7 @@ class DrawingViewModel(
         if (p is DrawingPrimitive.RangeLabelPrimitive) {
             val newSpan = (p.arrowSpan * factor).coerceAtLeast(0.2f)
             val updatedPrimitive = p.copy(arrowSpan = newSpan)
-            val arr = computeBounds(updatedPrimitive)
+            val arr = updatedPrimitive.computeBounds(boundsMeasurePaint)
             val newBounds = if (arr != null) Bounds(arr[0], arr[1], arr[2], arr[3]) else pe.bounds
             _pendingEdit.value = pe.copy(primitive = updatedPrimitive, bounds = newBounds)
         }
@@ -797,7 +1721,7 @@ class DrawingViewModel(
         val pe = _pendingEdit.value
         val p = pe.primitive
         if (p is DrawingPrimitive.RangeLabelPrimitive) {
-            val clamped = targetSize.coerceIn(20f, 200f)
+            val clamped = targetSize.coerceIn(20f, 600f)
             _pendingEdit.value = pe.copy(primitive = p.copy(fontSize = clamped))
         }
     }
@@ -832,7 +1756,9 @@ class DrawingViewModel(
             else -> return
         }
         if (baseFontSize <= 0f) return
-        val scale = (targetSize / baseFontSize).coerceIn(0.1f, 10f)
+        // 不钳制比例：滑块范围由 getPendingEffectiveFontSize/applyTransform 的
+        // coerceIn(30f,600f) 兜底，保证滑块能拉满整个范围
+        val scale = targetSize / baseFontSize
         _pendingEdit.value = pe.copy(scaleX = scale, scaleY = scale)
     }
 
@@ -845,113 +1771,17 @@ class DrawingViewModel(
         _numberLabel.value = _numberLabel.value.copy(currentValue = newValue)
     }
 
-    fun updatePendingRangeValue(isStart: Boolean, newValue: Int) {
-        val pe = _pendingEdit.value
-        val p = pe.primitive
-        if (p is DrawingPrimitive.RangeLabelPrimitive) {
-            val updated = if (isStart) p.copy(startValue = newValue) else p.copy(endValue = newValue)
-            _pendingEdit.value = pe.copy(primitive = updated)
-        }
-    }
-
-    private fun applyTransform(p: DrawingPrimitive, pe: PendingEdit): DrawingPrimitive {
-        val dx = pe.offsetX; val dy = pe.offsetY
-        val sx = pe.scaleX; val sy = pe.scaleY
-        val cosR = cos(pe.rotation.toDouble()).toFloat(); val sinR = sin(pe.rotation.toDouble()).toFloat()
-        val bounds = pe.bounds
-        val cx0 = bounds?.let { (it.minX + it.maxX) / 2f } ?: 0f
-        val cy0 = bounds?.let { (it.minY + it.maxY) / 2f } ?: 0f
-        fun transform(wx: Float, wy: Float): Point2D {
-            var x = (wx - cx0) * sx; var y = (wy - cy0) * sy
-            val rx = x * cosR - y * sinR + cx0 + dx; val ry = x * sinR + y * cosR + cy0 + dy
-            return Point2D(rx, ry)
-        }
-        return when (p) {
-            is DrawingPrimitive.FreehandPath -> p.copy(points = p.points.map { transform(it.x, it.y) })
-            is DrawingPrimitive.RectanglePrimitive -> {
-                if (dx == 0f && dy == 0f && pe.rotation == 0f && sx == 1f && sy == 1f) return p
-                val newRotation = (p.rotation + pe.rotation) % (2f * kotlin.math.PI.toFloat())
-                // 原始矩形半宽半高和中心
-                val hw0 = abs(p.endX - p.startX) / 2f
-                val hh0 = abs(p.endY - p.startY) / 2f
-                val rectCx = (p.startX + p.endX) / 2f
-                val rectCy = (p.startY + p.endY) / 2f
-                val cosR0 = cos(p.rotation.toDouble()).toFloat()
-                val sinR0 = sin(p.rotation.toDouble()).toFloat()
-                // 原始4个角（含 p.rotation）
-                fun rc(dx: Float, dy: Float) = Point2D(rectCx + dx * cosR0 - dy * sinR0,
-                    rectCy + dx * sinR0 + dy * cosR0)
-                val corners = listOf(rc(-hw0, -hh0), rc(hw0, -hh0), rc(hw0, hh0), rc(-hw0, hh0))
-                // 应用 PendingEdit 变换
-                val t = corners.map { transform(it.x, it.y) }
-                // 从边长计算实际宽高（变换后的矩形，非 AABB）
-                val w = sqrt(((t[1].x - t[0].x) * (t[1].x - t[0].x) +
-                    (t[1].y - t[0].y) * (t[1].y - t[0].y)).toDouble()).toFloat()
-                val h = sqrt(((t[2].x - t[1].x) * (t[2].x - t[1].x) +
-                    (t[2].y - t[1].y) * (t[2].y - t[1].y)).toDouble()).toFloat()
-                val newCx = (t.sumOf { it.x.toDouble() } / 4f).toFloat()
-                val newCy = (t.sumOf { it.y.toDouble() } / 4f).toFloat()
-                return p.copy(
-                    startX = newCx - w / 2f, startY = newCy - h / 2f,
-                    endX = newCx + w / 2f, endY = newCy + h / 2f,
-                    rotation = newRotation
-                )
-            }
-            is DrawingPrimitive.CirclePrimitive -> {
-                if (dx == 0f && dy == 0f && pe.rotation == 0f && sx == 1f && sy == 1f) return p
-                val origRx = abs(p.endX - p.centerX); val origRy = abs(p.endY - p.centerY)
-                val segs = 32
-                val pts = (0..segs).map { i ->
-                    val a = (i.toFloat() / segs) * 2f * kotlin.math.PI.toFloat()
-                    transform(p.centerX + origRx * cos(a), p.centerY + origRy * sin(a))
-                }
-                DrawingPrimitive.FreehandPath(points = pts, isClosed = true, color = p.color,
-                    strokeWidth = p.strokeWidth, layerId = p.layerId, lineStyle = p.lineStyle)
-            }
-            is DrawingPrimitive.LinePrimitive -> {
-                val s = transform(p.startX, p.startY); val e = transform(p.endX, p.endY)
-                p.copy(startX = s.x, startY = s.y, endX = e.x, endY = e.y)
-            }
-            is DrawingPrimitive.NumberLabelPrimitive -> {
-                val t = transform(p.x, p.y)
-                val newRotation = (p.rotation + pe.rotation) % (2f * kotlin.math.PI.toFloat())
-                val avgScale = sqrt(abs(sx * sy))
-                val newFontSize = (p.fontSize * avgScale).coerceIn(30f, 600f)
-                p.copy(x = t.x, y = t.y, rotation = newRotation, fontSize = newFontSize)
-            }
-            is DrawingPrimitive.TextPrimitive -> {
-                val t = transform(p.x, p.y)
-                val newRotation = (p.rotation + pe.rotation) % (2f * kotlin.math.PI.toFloat())
-                val avgScale = sqrt(abs(sx * sy))
-                val newFontSize = (p.fontSize * avgScale).coerceIn(30f, 600f)
-                p.copy(x = t.x, y = t.y, rotation = newRotation, fontSize = newFontSize)
-            }
-            is DrawingPrimitive.RangeLabelPrimitive -> {
-                val t = transform(p.x, p.y)
-                val newRotation = (p.rotation + pe.rotation) % (2f * kotlin.math.PI.toFloat())
-                // 箭头杆长：角手柄均匀缩放（sx≈sy）时同步放大 arrowSpan，中点手柄已由 updatePendingArrowSpan 直接修改
-                val avgScale = sqrt(abs(sx * sy))
-                val isUniform = abs(sx - sy) < 0.01f
-                val newFontSize = if (isUniform) (p.fontSize * avgScale).coerceIn(20f, 600f) else p.fontSize
-                val newArrowSpan = ((p.arrowSpan / p.fontSize) * newFontSize).coerceAtLeast(0.2f)
-                p.copy(x = t.x, y = t.y, rotation = newRotation, fontSize = newFontSize, arrowSpan = newArrowSpan)
-            }
-            is DrawingPrimitive.BlockRefPrimitive -> {
-                val t = transform(p.x, p.y)
-                val avgScale = sqrt(abs(sx * sy))
-                val newRotation = (p.rotation + pe.rotation) % (2f * kotlin.math.PI.toFloat())
-                p.copy(x = t.x, y = t.y, rotation = newRotation, scale = (p.scale * avgScale).coerceIn(0.1f, 10f))
-            }
-        }
-    }
-
     // ═══════════════════════════════════════════════════════
     //  选择操作
     // ═══════════════════════════════════════════════════════
 
     fun startSelection(point: Point2D) {
-        _selection.value = SelectionState(isActive = true, selStartX = point.x, selStartY = point.y,
-            selEndX = point.x, selEndY = point.y)
+        _transformState = null  // 清除残留的变换快照，防止新拖框与旧变换状态冲突
+        _selection.value = _selection.value.copy(
+            isActive = true,
+            selStartX = point.x, selStartY = point.y,
+            selEndX = point.x, selEndY = point.y
+        )
     }
 
     fun updateSelection(point: Point2D) {
@@ -961,27 +1791,68 @@ class DrawingViewModel(
         }
     }
 
+    /** 图层是否可见（不存在视为不可见）：选择/编辑只作用于可见层，与画布渲染一致 */
+    private fun isEditLayerVisible(layerId: Int): Boolean =
+        _layers.find { it.id == layerId }?.isVisible == true
+
     fun endSelection() {
         val s = _selection.value
-        if (!s.isActive) { _selection.value = SelectionState(); return }
+        if (!s.isActive) return  // no drag in progress, keep existing selection
         // 根据拖框方向确定选中模式：左→右=完全包含，右→左=交叉选中
-        val lr = s.selStartX <= s.selEndX
+        // 横屏模式：方向轴旋转 90°，改为上→下=完全包含，下→上=交叉选中
+        val lr = if (_isLandscape.value) s.selStartY <= s.selEndY else s.selStartX <= s.selEndX
         val selBounds = Bounds(minOf(s.selStartX, s.selEndX), minOf(s.selStartY, s.selEndY),
             maxOf(s.selStartX, s.selEndX), maxOf(s.selStartY, s.selEndY))
-        val allSelected = _primitives.indices.filter { i ->
+        val dragSelected = _primitives.indices.filter { i ->
             val p = _primitives[i] ?: return@filter false
-            val pb = computeBounds(p) ?: return@filter false
+            if (!isEditLayerVisible(p.layerId)) return@filter false  // 隐藏层不参与选择，避免误删/误移不可见元素
+            val pb = p.computeBounds(boundsMeasurePaint) ?: return@filter false
             if (lr) {
-                // INSIDE_TOUCH：完全包含
+                // FULLY_COVER：完全包含
                 pb[0] >= selBounds.minX && pb[1] >= selBounds.minY &&
                     pb[2] <= selBounds.maxX && pb[3] <= selBounds.maxY
             } else {
                 // 交叉选中：有交集，且实际碰触图形（不选隔空戳到包围盒的）
                 pb[0] <= selBounds.maxX && pb[2] >= selBounds.minX &&
                     pb[1] <= selBounds.maxY && pb[3] >= selBounds.minY &&
-                    fenceHitsGeometry(p, selBounds)
+                    p.fenceHitsGeometry(selBounds)
             }
         }.toSet()
+        // 判断拖框是否有实际面积（区分点击 vs 拖拽）
+        val dragW = kotlin.math.abs(s.selEndX - s.selStartX)
+        val dragH = kotlin.math.abs(s.selEndY - s.selStartY)
+        val isMeaningfulDrag = dragW > 5f || dragH > 5f
+        val prevSelected = s.selectedIndices
+        if (!isMeaningfulDrag) {
+            // 点击：尝试选中最近的基元
+            val tapPoint = Point2D(s.selStartX, s.selStartY)
+            val tol = 40f / _canvasScale.value
+            var bestIdx = -1; var bestDist = Float.MAX_VALUE
+            for ((i, p) in _primitives.withIndex()) {
+                if (!isEditLayerVisible(p.layerId)) continue  // 隐藏层不参与点选
+                val dist = p.distanceTo(tapPoint)
+                if (dist < bestDist) { bestDist = dist; bestIdx = i }
+            }
+            val tappedIdx = if (bestIdx >= 0 && bestDist < tol) bestIdx else -1
+            // 点选累加（多选）：点未选中元素→加入；点已选中元素→移出；点空白→保留旧选择
+            val newSelected = if (tappedIdx >= 0) {
+                if (tappedIdx in prevSelected) prevSelected - tappedIdx else prevSelected + tappedIdx
+            } else prevSelected
+            val hideMpTap = newSelected.isNotEmpty() && newSelected.all { i ->
+                val p = _primitives.getOrNull(i)
+                p is DrawingPrimitive.TextPrimitive || p is DrawingPrimitive.NumberLabelPrimitive
+            }
+            _selection.value = SelectionState(
+                selectedIndices = newSelected,
+                bounds = computeSelectionBounds(newSelected),
+                rotation = if (tappedIdx >= 0) computeSelectionRotation(newSelected) else s.rotation,
+                direction = if (lr) SelectDirection.FULLY_COVER else SelectDirection.INSIDE_TOUCH,
+                hideMidpoints = hideMpTap
+            )
+            return
+        }
+        // 点击空白 → 保留旧选择；空拖 → 保留旧选择；选到东西 → 合并到旧选择
+        val allSelected = if (dragSelected.isNotEmpty()) prevSelected + dragSelected else prevSelected
         val hideMp = allSelected.isNotEmpty() && allSelected.all { i ->
             val p = _primitives.getOrNull(i)
             p is DrawingPrimitive.TextPrimitive || p is DrawingPrimitive.NumberLabelPrimitive
@@ -990,28 +1861,17 @@ class DrawingViewModel(
             selectedIndices = allSelected,
             bounds = computeSelectionBounds(allSelected),
             rotation = computeSelectionRotation(allSelected),
-            direction = if (lr) SelectDirection.INSIDE_TOUCH else SelectDirection.FULLY_COVER,
+            direction = if (lr) SelectDirection.FULLY_COVER else SelectDirection.INSIDE_TOUCH,
             hideMidpoints = hideMp
         )
     }
 
-    /** Compute average rotation of selected primitives */
+    /** Compute rotation for selection frame.
+     *  Single selection → match the element's intrinsic rotation.
+     *  Multiple selection → unrotated frame. */
     private fun computeSelectionRotation(indices: Set<Int>): Float {
-        if (indices.isEmpty()) return 0f
-        var sum = 0f; var count = 0
-        for (i in indices) {
-            val p = _primitives.getOrNull(i) ?: continue
-            val r = when (p) {
-                is DrawingPrimitive.RectanglePrimitive -> p.rotation
-                is DrawingPrimitive.NumberLabelPrimitive -> p.rotation
-                is DrawingPrimitive.TextPrimitive -> p.rotation
-                is DrawingPrimitive.RangeLabelPrimitive -> p.rotation
-                is DrawingPrimitive.BlockRefPrimitive -> p.rotation
-                else -> 0f
-            }
-            sum += r; count++
-        }
-        return if (count > 0) sum / count else 0f
+        if (indices.size != 1) return 0f
+        return _primitives.getOrNull(indices.first())?.intrinsicRotation ?: 0f
     }
 
     fun computeSelectionBounds(indices: Set<Int>): Bounds? {
@@ -1020,196 +1880,506 @@ class DrawingViewModel(
         var maxX = -Float.MAX_VALUE; var maxY = -Float.MAX_VALUE
         for (i in indices) {
             val p = _primitives.getOrNull(i) ?: continue
-            val b = computeBounds(p) ?: continue
+            // BlockRef 的 computeBounds 是固定占位框，这里按块实际内容计算
+            val b = when (p) {
+                is DrawingPrimitive.BlockRefPrimitive ->
+                    computeBlockRefWorldBounds(p)?.let { floatArrayOf(it.minX, it.minY, it.maxX, it.maxY) }
+                // 矩形的 computeBounds 不含旋转，多选框是不旋转的，必须用含旋转的世界 AABB
+                is DrawingPrimitive.RectanglePrimitive -> p.worldBounds()
+                else -> p.computeBounds(boundsMeasurePaint)
+            } ?: continue
             minX = minOf(minX, b[0], b[2]); minY = minOf(minY, b[1], b[3])
             maxX = maxOf(maxX, b[0], b[2]); maxY = maxOf(maxY, b[1], b[3])
         }
         return if (minX != Float.MAX_VALUE) Bounds(minX, minY, maxX, maxY) else null
     }
 
+    /** BlockRef 的世界包围盒：与 BlockRender.withBlockTransform 同一公式（先减形心 → 缩放 → 旋转 → 加锚点） */
+    private fun computeBlockRefWorldBounds(p: DrawingPrimitive.BlockRefPrimitive): Bounds? {
+        val bd = _blockDefs.find { it.id == p.blockDefId } ?: return null
+        val cb = computeBlockBounds(bd.primitives) ?: return null
+        // 与渲染同款形心（不是 AABB 中心），否则非对称块的包围盒与实际绘制位置有偏差
+        val centroid = blockContentCentroid(bd.primitives) ?: return null
+        // 唯一映射在 model.BlockTransform.blockMapPoint（渲染/包围盒/DXF 同源）
+        fun map(wx: Float, wy: Float): Point2D = blockMapPoint(wx, wy, p, centroid)
+        val pts = listOf(
+            map(cb.minX, cb.minY), map(cb.maxX, cb.minY),
+            map(cb.maxX, cb.maxY), map(cb.minX, cb.maxY)
+        )
+        val xs = pts.map { it.x }; val ys = pts.map { it.y }
+        return Bounds(xs.min(), ys.min(), xs.max(), ys.max())
+    }
+
     fun clearSelection() {
-        _selection.value = SelectionState()
-        _selectionSnapshot = null
-        _scaleAccumAvg = 1f
+        _selection.value = SelectionState(
+            selScaleX = 1f, selScaleY = 1f, selOffsetX = 0f, selOffsetY = 0f
+        )
+        _transformState = null
+        selectionAdjustUndoPushed = false
+        lineEndpointUndoPushed = false
+        clearRectDragLocks()
+    }
+
+    /** Returns counts of each primitive type in the current selection, keyed by display name. */
+    fun getSelectionTypeCounts(): Map<String, Int> {
+        val counts = linkedMapOf<String, Int>()
+        for (i in _selection.value.selectedIndices.sorted()) {
+            if (i >= _primitives.size) continue
+            val name = _primitives[i].typeName
+            counts[name] = (counts[name] ?: 0) + 1
+        }
+        return counts
+    }
+
+    /** Filter selection to specific indices (used by type filter dialog). */
+    fun filterSelectionToIndices(indices: Set<Int>) {
+        if (indices.isEmpty()) { clearSelection(); return }
+        _selection.value = _selection.value.copy(
+            selectedIndices = indices,
+            bounds = computeSelectionBounds(indices),
+            rotation = computeSelectionRotation(indices)
+        )
     }
 
     fun moveSelectedPrimitives(dx: Float, dy: Float) {
         val indices = _selection.value.selectedIndices
         if (indices.isEmpty()) return
-        if (_selectionSnapshot == null) {
-            _selectionSnapshot = indices.associateWith { _primitives[it] }
+        val (mDx, mDy) = applyOrthoConstraint(dx, dy, forceNewSession = _transformState == null)
+        if (_transformState == null) {
+            val s = _selection.value
+            _transformState = SelectionTransformState(
+                snapshot = indices.associateWith { _primitives[it] },
+                startRotation = s.rotation,
+                startScaleX = s.selScaleX,
+                startScaleY = s.selScaleY,
+                startOffsetX = s.selOffsetX,
+                startOffsetY = s.selOffsetY
+            )
+            _selection.value = _selection.value.copy(
+                initialBounds = _selection.value.bounds,
+                startRotation = s.rotation,
+                startScaleX = s.selScaleX,
+                startScaleY = s.selScaleY,
+                startX = s.selOffsetX,
+                startY = s.selOffsetY
+            )
             pushUndo()
         }
-        for (i in indices) {
-            val p = _primitives[i] ?: continue
-            _primitives[i] = when (p) {
-                is DrawingPrimitive.FreehandPath -> p.copy(points = p.points.map { Point2D(it.x + dx, it.y + dy) })
-                is DrawingPrimitive.RectanglePrimitive -> p.copy(startX = p.startX + dx, startY = p.startY + dy, endX = p.endX + dx, endY = p.endY + dy)
-                is DrawingPrimitive.CirclePrimitive -> p.copy(centerX = p.centerX + dx, centerY = p.centerY + dy, endX = p.endX + dx, endY = p.endY + dy)
-                is DrawingPrimitive.LinePrimitive -> p.copy(startX = p.startX + dx, startY = p.startY + dy, endX = p.endX + dx, endY = p.endY + dy)
-                is DrawingPrimitive.NumberLabelPrimitive -> p.copy(x = p.x + dx, y = p.y + dy)
-                is DrawingPrimitive.TextPrimitive -> p.copy(x = p.x + dx, y = p.y + dy)
-                is DrawingPrimitive.RangeLabelPrimitive -> p.copy(x = p.x + dx, y = p.y + dy)
-                is DrawingPrimitive.BlockRefPrimitive -> p.copy(x = p.x + dx, y = p.y + dy)
-            }
+        _selection.value = _selection.value.copy(
+            isTransforming = true,
+            selOffsetX = _selection.value.selOffsetX + mDx,
+            selOffsetY = _selection.value.selOffsetY + mDy
+        )
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  选择态：单选直线拖端点（直接烘焙几何，与待确认端点拖拽同口径）
+    // ═══════════════════════════════════════════════════════
+
+    /** 一次端点拖动会话只压一次撤销快照（松手由 finishSelectionDrag 复位） */
+    private var lineEndpointUndoPushed = false
+
+    /**
+     * 单选直线拖动端点：直接改图元几何（不走 selection 变换参数），另一端固定。
+     * 零长保护：两端屏幕距离小于 6dp 不写回，避免拖出一条看不见的线。
+     */
+    fun moveSelectedLineEndpoint(isStart: Boolean, x: Float, y: Float) {
+        val idx = _selection.value.selectedIndices.singleOrNull() ?: return
+        val p = _primitives.getOrNull(idx) as? DrawingPrimitive.LinePrimitive ?: return
+        val fixedX = if (isStart) p.endX else p.startX
+        val fixedY = if (isStart) p.endY else p.startY
+        val minLen = 6f / _canvasScale.value.coerceAtLeast(0.01f)
+        val ddx = x - fixedX
+        val ddy = y - fixedY
+        if (ddx * ddx + ddy * ddy < minLen * minLen) return
+        if (!lineEndpointUndoPushed) { pushUndo(); lineEndpointUndoPushed = true }
+        _primitives[idx] = if (isStart) p.copy(startX = x, startY = y) else p.copy(endX = x, endY = y)
+        // 端点改了，选择框必须跟着走，否则后续阵列/缩放仍按旧包围盒计算
+        _selection.value = _selection.value.copy(
+            bounds = computeSelectionBounds(setOf(idx)),
+            rotation = computeSelectionRotation(setOf(idx))
+        )
+        hasUnsavedChanges = true
+    }
+
+    /** 一次选择拖动结束：端点会话标记复位；有未收尾的变换会话先烘焙，再落盘。 */
+    fun finishSelectionDrag() {
+        lineEndpointUndoPushed = false
+        if (_transformState != null) {
+            finalizeSelectionTransform()
+            return
         }
-        _selection.value = _selection.value.copy(bounds = computeSelectionBounds(_selection.value.selectedIndices))
+        autoSave()
     }
 
     fun scaleSelectedPrimitives(sx: Float, sy: Float) {
         val indices = _selection.value.selectedIndices
         if (indices.isEmpty()) return
-        if (_selectionSnapshot == null) {
-            _selectionSnapshot = indices.associateWith { _primitives[it] }
-            _selection.value = _selection.value.copy(initialBounds = _selection.value.bounds)
-            _scaleAccumAvg = 1f
+        if (_transformState == null) {
+            val s = _selection.value
+            _transformState = SelectionTransformState(
+                snapshot = indices.associateWith { _primitives[it] },
+                startRotation = s.rotation,
+                startScaleX = s.selScaleX,
+                startScaleY = s.selScaleY,
+                startOffsetX = s.selOffsetX,
+                startOffsetY = s.selOffsetY
+            )
+            _selection.value = _selection.value.copy(
+                initialBounds = _selection.value.bounds,
+                startRotation = s.rotation,
+                startScaleX = s.selScaleX,
+                startScaleY = s.selScaleY,
+                startX = s.selOffsetX,
+                startY = s.selOffsetY
+            )
             pushUndo()
         }
-        val selBounds = _selection.value.initialBounds ?: _selection.value.bounds ?: return
-        val cx = (selBounds.minX + selBounds.maxX) / 2f; val cy = (selBounds.minY + selBounds.maxY) / 2f
-        _scaleAccumAvg *= sqrt(abs(sx * sy))
-        for (i in indices) {
-            val p = _primitives[i] ?: continue
-            fun tx(wx: Float, wy: Float) = Point2D(cx + (wx - cx) * sx, cy + (wy - cy) * sy)
-            val snapshotP = _selectionSnapshot?.get(i)
-            _primitives[i] = when (p) {
-                is DrawingPrimitive.FreehandPath -> p.copy(points = p.points.map { tx(it.x, it.y) })
-                is DrawingPrimitive.RectanglePrimitive -> {
-                    if (sx != 1f || sy != 1f) {
-                        val hw = abs(p.endX - p.startX) / 2f
-                        val hh = abs(p.endY - p.startY) / 2f
-                        val rcx = (p.startX + p.endX) / 2f
-                        val rcy = (p.startY + p.endY) / 2f
-                        val cosP = kotlin.math.cos(p.rotation)
-                        val sinP = kotlin.math.sin(p.rotation)
-                        fun rc(dx: Float, dy: Float) = Point2D(rcx + dx * cosP - dy * sinP,
-                            rcy + dx * sinP + dy * cosP)
-                        val corners = listOf(rc(-hw, -hh), rc(hw, -hh), rc(hw, hh), rc(-hw, hh))
-                        val sc = corners.map { tx(it.x, it.y) }
-                        // 从边长计算实际宽高
-                        val nw = sqrt(((sc[1].x - sc[0].x) * (sc[1].x - sc[0].x) +
-                            (sc[1].y - sc[0].y) * (sc[1].y - sc[0].y)).toDouble()).toFloat()
-                        val nh = sqrt(((sc[2].x - sc[1].x) * (sc[2].x - sc[1].x) +
-                            (sc[2].y - sc[1].y) * (sc[2].y - sc[1].y)).toDouble()).toFloat()
-                        val ncx = (sc.sumOf { it.x.toDouble() } / 4f).toFloat()
-                        val ncy = (sc.sumOf { it.y.toDouble() } / 4f).toFloat()
-                        p.copy(startX = ncx - nw / 2f, startY = ncy - nh / 2f,
-                            endX = ncx + nw / 2f, endY = ncy + nh / 2f, rotation = p.rotation)
-                    } else p
-                }
-                is DrawingPrimitive.CirclePrimitive -> {
-                    val c = tx(p.centerX, p.centerY); val e = tx(p.endX, p.endY)
-                    p.copy(centerX = c.x, centerY = c.y, endX = e.x, endY = e.y)
-                }
-                is DrawingPrimitive.LinePrimitive -> {
-                    val s = tx(p.startX, p.startY); val e = tx(p.endX, p.endY)
-                    p.copy(startX = s.x, startY = s.y, endX = e.x, endY = e.y)
-                }
-                is DrawingPrimitive.NumberLabelPrimitive -> {
-                    val t = tx(p.x, p.y)
-                    val origFontSize = (snapshotP as? DrawingPrimitive.NumberLabelPrimitive)?.fontSize ?: p.fontSize
-                    p.copy(x = t.x, y = t.y, fontSize = (origFontSize * _scaleAccumAvg).coerceIn(30f, 600f))
-                }
-                is DrawingPrimitive.TextPrimitive -> {
-                    val t = tx(p.x, p.y)
-                    val origFontSize = (snapshotP as? DrawingPrimitive.TextPrimitive)?.fontSize ?: p.fontSize
-                    p.copy(x = t.x, y = t.y, fontSize = (origFontSize * _scaleAccumAvg).coerceIn(30f, 600f))
-                }
-                is DrawingPrimitive.RangeLabelPrimitive -> {
-                    val t = tx(p.x, p.y)
-                    val origFontSize = (snapshotP as? DrawingPrimitive.RangeLabelPrimitive)?.fontSize ?: p.fontSize
-                    p.copy(x = t.x, y = t.y, fontSize = (origFontSize * _scaleAccumAvg).coerceIn(20f, 600f))
-                }
-                is DrawingPrimitive.BlockRefPrimitive -> {
-                    val t = tx(p.x, p.y)
-                    p.copy(x = t.x, y = t.y, scale = (p.scale * sx).coerceIn(0.1f, 10f))
-                }
-            }
-        }
-        _selection.value = _selection.value.copy(bounds = computeSelectionBounds(_selection.value.selectedIndices))
+        val curSX = _selection.value.selScaleX
+        val curSY = _selection.value.selScaleY
+        _selection.value = _selection.value.copy(
+            isTransforming = true,
+            selScaleX = (curSX * sx).coerceIn(0.1f, 10f),
+            selScaleY = (curSY * sy).coerceIn(0.1f, 10f)
+        )
+    }
+
+    /** 开启一次选择变换会话（首次变换：快照 + 一次 undo）。 */
+    private fun beginSelectionTransformSession(indices: Set<Int>) {
+        if (_transformState != null) return
+        val s = _selection.value
+        _transformState = SelectionTransformState(
+            snapshot = indices.associateWith { _primitives[it] },
+            startRotation = s.rotation,
+            startScaleX = s.selScaleX,
+            startScaleY = s.selScaleY,
+            startOffsetX = s.selOffsetX,
+            startOffsetY = s.selOffsetY
+        )
+        _selection.value = _selection.value.copy(
+            initialBounds = _selection.value.bounds,
+            startRotation = s.rotation,
+            startScaleX = s.selScaleX,
+            startScaleY = s.selScaleY,
+            startX = s.selOffsetX,
+            startY = s.selOffsetY
+        )
+        pushUndo()
+    }
+
+    /** 正交步进旋转（选择态）：精确 ±90°，不走 45° 吸附余量；UI 之后调 finalizeSelectionTransform()。 */
+    fun stepRotateSelected(delta: Float) {
+        val indices = _selection.value.selectedIndices
+        if (indices.isEmpty()) return
+        beginSelectionTransformSession(indices)
+        _orthoFreeRot = null
+        _selection.value = _selection.value.copy(
+            isTransforming = true,
+            rotation = _selection.value.rotation + delta
+        )
     }
 
     fun rotateSelectedPrimitives(rotation: Float) {
         val indices = _selection.value.selectedIndices
         if (indices.isEmpty()) return
-        if (_selectionSnapshot == null) {
-            _selectionSnapshot = indices.associateWith { _primitives[it] }
-            _selection.value = _selection.value.copy(initialBounds = _selection.value.bounds)
-            pushUndo()
-        }
-        val selBounds = _selection.value.initialBounds ?: _selection.value.bounds ?: return
-        val cx = (selBounds.minX + selBounds.maxX) / 2f; val cy = (selBounds.minY + selBounds.maxY) / 2f
-        val cosR = cos(rotation); val sinR = sin(rotation)
-        fun rot(wx: Float, wy: Float): Point2D {
-            val dx = wx - cx; val dy = wy - cy
-            return Point2D(cx + dx * cosR - dy * sinR, cy + dx * sinR + dy * cosR)
-        }
-        for (i in indices) {
-            val p = _primitives[i] ?: continue
-            _primitives[i] = when (p) {
-                is DrawingPrimitive.FreehandPath -> p.copy(points = p.points.map { rot(it.x, it.y) })
-                is DrawingPrimitive.RectanglePrimitive -> {
-                    val rcX = minOf(p.startX, p.endX) + abs(p.endX - p.startX) / 2f
-                    val rcY = minOf(p.startY, p.endY) + abs(p.endY - p.startY) / 2f
-                    val hw = abs(p.endX - p.startX) / 2f
-                    val hh = abs(p.endY - p.startY) / 2f
-                    val cosP = kotlin.math.cos(p.rotation)
-                    val sinP = kotlin.math.sin(p.rotation)
-                    // Visual corners centered on rectangle's own center, then rotated around selection center
-                    val visCorners = listOf(
-                        rcX + (-hw) * cosP - (-hh) * sinP to rcY + (-hw) * sinP + (-hh) * cosP,
-                        rcX + ( hw) * cosP - (-hh) * sinP to rcY + ( hw) * sinP + (-hh) * cosP,
-                        rcX + ( hw) * cosP - ( hh) * sinP to rcY + ( hw) * sinP + ( hh) * cosP,
-                        rcX + (-hw) * cosP - ( hh) * sinP to rcY + (-hw) * sinP + ( hh) * cosP,
-                    )
-                    val cosR = kotlin.math.cos(rotation); val sinR = kotlin.math.sin(rotation)
-                    val transCorners = visCorners.map { (wx, wy) ->
-                        val dx2 = wx - cx; val dy2 = wy - cy
-                        Point2D(cx + dx2 * cosR - dy2 * sinR, cy + dx2 * sinR + dy2 * cosR)
-                    }
-                    val xs = transCorners.map { it.x }; val ys = transCorners.map { it.y }
-                    p.copy(startX = xs.min(), startY = ys.min(),
-                        endX = xs.max(), endY = ys.max(),
-                        rotation = p.rotation + rotation)
-                }
-                is DrawingPrimitive.CirclePrimitive -> {
-                    val c = rot(p.centerX, p.centerY); val e = rot(p.endX, p.endY)
-                    p.copy(centerX = c.x, centerY = c.y, endX = e.x, endY = e.y)
-                }
-                is DrawingPrimitive.LinePrimitive -> { val s = rot(p.startX, p.startY); val e = rot(p.endX, p.endY); p.copy(startX = s.x, startY = s.y, endX = e.x, endY = e.y) }
-                is DrawingPrimitive.NumberLabelPrimitive -> { val t = rot(p.x, p.y); p.copy(x = t.x, y = t.y, rotation = p.rotation + rotation) }
-                is DrawingPrimitive.TextPrimitive -> { val t = rot(p.x, p.y); p.copy(x = t.x, y = t.y, rotation = p.rotation + rotation) }
-                is DrawingPrimitive.RangeLabelPrimitive -> { val t = rot(p.x, p.y); p.copy(x = t.x, y = t.y, rotation = p.rotation + rotation) }
-                is DrawingPrimitive.BlockRefPrimitive -> { val t = rot(p.x, p.y); p.copy(x = t.x, y = t.y, rotation = p.rotation + rotation) }
+        beginSelectionTransformSession(indices)
+        if (_orthoMode.value) {
+            // 正交：旋转吸附 45° 档。seed 校验：snap(free)≈当前角 → 连续微调保留自由余量；
+            // 否则（选择切换/外部重置）对齐当前角，避免 22.5° 分界附近丢余量跳档。
+            val cur = _selection.value.rotation
+            val fr = _orthoFreeRot
+            if (fr == null || Math.abs(Math.round(fr / 45f) * 45f - cur) > 1f) {
+                _orthoFreeRot = cur
             }
+            val free = (_orthoFreeRot ?: cur) + rotation
+            _orthoFreeRot = free
+            _selection.value = _selection.value.copy(
+                isTransforming = true,
+                rotation = Math.round(free / 45f) * 45f
+            )
+        } else {
+            _orthoFreeRot = null
+            val curR = _selection.value.rotation
+            _selection.value = _selection.value.copy(
+                isTransforming = true,
+                rotation = curR + rotation
+            )
         }
-        val curR = _selection.value.rotation
-        _selection.value = _selection.value.copy(rotation = curR + rotation)
     }
 
-    fun confirmSelectionTransform() {
-        _selectionSnapshot = null; _scaleAccumAvg = 1f
-        val s = _selection.value
-        if (s.isTransforming) {
-            _selection.value = s.copy(isTransforming = false, rotation = 0f, initialBounds = null,
-                bounds = computeSelectionBounds(s.selectedIndices))
+    /** 方向键微调：对选中图形做小步平移（连续微调会话 0.7s 内合并为一次 undo；结束后延迟自动保存）。 */
+    private var _nudgeLastTime = 0L
+    private var _nudgeSaveJob: kotlinx.coroutines.Job? = null
+
+    fun nudgeSelection(dx: Float, dy: Float) {
+        val indices = _selection.value.selectedIndices
+        if (indices.isEmpty()) return
+        val now = System.currentTimeMillis()
+        if (now - _nudgeLastTime > 700L) pushUndo()
+        _nudgeLastTime = now
+        for (i in indices) {
+            val p = _primitives.getOrNull(i) ?: continue
+            _primitives[i] = p.shiftPrimitive(dx, dy)
+        }
+        _selection.value = _selection.value.copy(
+            bounds = _selection.value.bounds?.let {
+                Bounds(it.minX + dx, it.minY + dy, it.maxX + dx, it.maxY + dy)
+            },
+            initialBounds = null
+        )
+        hasUnsavedChanges = true
+        _nudgeSaveJob?.cancel()
+        _nudgeSaveJob = viewModelScope.launch {
+            kotlinx.coroutines.delay(700L)
             autoSave()
         }
     }
 
-    /** 选择变换实时生效：清除快照但保留修改。 */
-    fun finalizeSelectionTransform() {
-        _selectionSnapshot = null; _scaleAccumAvg = 1f
-        val s = _selection.value
-        _selection.value = s.copy(initialBounds = null)
-        autoSave()
+    /** 选择模式中间手柄拖拽：矩形/圆拉边（对边/对点固定），直线拉端点（另一端固定）。
+     *  [amount] 为世界坐标位移（PFO 已做 padding 修正，与手指 1:1）。
+     *  [edgeIndex] 为 PFO 中点索引 [top,bottom,left,right]（直线为 [起点侧, 终点侧]）。 */
+    fun midpointDragSelected(edgeIndex: Int, amount: Float) {
+        val indices = _selection.value.selectedIndices
+        if (indices.isEmpty()) return
+
+        // 首次拖拽：推 undo + 记录快照（整个拖拽手势只记一次，保留快照防止 finalize 回退逻辑误判）
+        if (_transformState == null) {
+            pushUndo()
+            val s = _selection.value
+            _transformState = SelectionTransformState(
+                snapshot = indices.associateWith { _primitives[it] },
+                startRotation = s.rotation,
+                startScaleX = s.selScaleX, startScaleY = s.selScaleY,
+                startOffsetX = s.selOffsetX, startOffsetY = s.selOffsetY
+            )
+            // 同步 SelectionState 的变换起始值：预览 transformEdit 用 sel.start* 算增量，
+            // 不更新会残留上一个手势的旧旋转/偏移，导致预览偏转、整体位移
+            _selection.value = _selection.value.copy(
+                startRotation = s.rotation,
+                startScaleX = s.selScaleX, startScaleY = s.selScaleY,
+                startX = s.selOffsetX, startY = s.selOffsetY
+            )
+            _rectMidpointActive = true
+            // 首帧：规范化 corners + 锁定被拖边身份（越界翻转修复）
+            lockRectDragTargets(indices, edgeIndex)
+        }
+
+        // 按类型分发：矩形→dragEdge（对边固定），圆/椭圆→dragEdge（对向顶点固定），直线→拉端点
+        for (idx in indices) {
+            when (val p = _primitives.getOrNull(idx)) {
+                is DrawingPrimitive.RectanglePrimitive -> {
+                    // 锁定身份版：固定两点索引 + 首帧法向（越过对边自然翻转、不再换边乱动）
+                    _primitives[idx] = applyLockedRectDrag(p, edgeIndex, amount)
+                }
+                is DrawingPrimitive.CirclePrimitive -> {
+                    val np = p.dragEdge(edgeIndex.coerceIn(0, 3), amount)
+                    _primitives[idx] = np
+                    // 手柄跟随被拖顶点（带符号半径）：拉过圆心时手柄连续穿过、不跳对面
+                    val ci = edgeIndex.coerceIn(0, 3)
+                    _rectDragHandleWorld.value = when (ci) {
+                        0 -> Point2D(np.centerX, np.centerY - np.rawRadiusY)
+                        1 -> Point2D(np.centerX, np.centerY + np.rawRadiusY)
+                        2 -> Point2D(np.centerX - np.rawRadiusX, np.centerY)
+                        else -> Point2D(np.centerX + np.rawRadiusX, np.centerY)
+                    }
+                }
+                is DrawingPrimitive.LinePrimitive -> {
+                    val dx = p.endX - p.startX; val dy = p.endY - p.startY
+                    val len = kotlin.math.sqrt(dx * dx + dy * dy)
+                    if (len > 0.001f) {
+                        val ux = dx / len; val uy = dy / len
+                        _primitives[idx] = if (edgeIndex == 0)
+                            p.copy(startX = p.startX - ux * amount, startY = p.startY - uy * amount)
+                        else
+                            p.copy(endX = p.endX + ux * amount, endY = p.endY + uy * amount)
+                    }
+                }
+                else -> {}
+            }
+        }
+
+        // 更新"被拖边中点"（世界坐标）供 PFO 让被拖手柄跟随显示
+        updateRectDragHandleWorld(indices)
+
+        // 重算选中框包围盒（跟随矩形当前位置，包围盒始终包裹元素）。
+        // 注（2026-10-13 双模型复核结论）：对单选矩形此处产出"局部 AABB"（computeBounds 不含旋转），
+        // 与 PFO「局部 AABB + frameRotation」的约定一致；当前该值仅中心被消费（局部/世界 AABB 中心相同），
+        // 不要改成 worldBounds——否则与 frameRotation 叠加有双重旋转隐患。
+        // 真正需要世界范围的消费者（如多选合并）请显式调用 worldBounds()。
+        val allXs = mutableListOf<Float>(); val allYs = mutableListOf<Float>()
+        for (idx in indices) {
+            val p = _primitives.getOrNull(idx) ?: continue
+            val b = p.computeBounds(null) ?: continue
+            allXs.add(b[0]); allXs.add(b[2]); allYs.add(b[1]); allYs.add(b[3])
+        }
+        val newBounds = if (allXs.isNotEmpty()) Bounds(allXs.min(), allYs.min(), allXs.max(), allYs.max())
+            else _selection.value.bounds ?: Bounds(0f, 0f, 100f, 100f)
+
+        // 设置 PFO 选框匹配新矩形（重置 scale/offset，已在角点上直接烘焙）
+        _selection.value = _selection.value.copy(
+            bounds = newBounds,
+            selScaleX = 1f, selScaleY = 1f,
+            selOffsetX = 0f, selOffsetY = 0f,
+            isTransforming = true
+        )
+        hasUnsavedChanges = true
     }
 
-    fun cancelSelectionTransform() {
-        val snap = _selectionSnapshot ?: return
-        for ((idx, original) in snap) { if (idx < _primitives.size) _primitives[idx] = original }
-        _selectionSnapshot = null; _scaleAccumAvg = 1f
-        _selection.value = SelectionState()
+    // ── 矩形中点拖拽 锁定实现（2026-10-13，越界翻转修复）──────────────────
+    /** 首帧：规范化 corners 顺序 + 锁定"被拖边身份"（两点索引 / 旋转带符号状态） */
+    private fun lockRectDragTargets(indices: Set<Int>, pfoEdgeIndex: Int) {
+        _rectDragCornerIdx = null; _rectDragRotSigned = null
+        _rectDragNormalLockX = 0f; _rectDragNormalLockY = 0f
+        val single = indices.singleOrNull() ?: return
+        val p = _primitives.getOrNull(single) as? DrawingPrimitive.RectanglePrimitive ?: return
+        // PFO midpoint index → rectangle edge index: PFO[top,bottom,left,right]=[edge0,edge2,edge3,edge1]
+        val edgeIdx = intArrayOf(0, 2, 3, 1)[pfoEdgeIndex.coerceIn(0, 3)]
+        // 规范化存储顺序为 [TL,TR,BR,BL]（仅顺序；几何不变）
+        val normalized = p.normalizedCorners()
+        if (normalized.size == 4) _primitives[single] = p.copy(corners = normalized)
+        _rectDragCornerIdx = intArrayOf(edgeIdx, (edgeIdx + 1) % 4)
+        val lnx: Float; val lny: Float
+        when (edgeIdx) {
+            0 -> { lnx = 0f; lny = -1f }
+            1 -> { lnx = 1f; lny = 0f }
+            2 -> { lnx = 0f; lny = 1f }
+            else -> { lnx = -1f; lny = 0f }
+        }
+        val rot = p.rotation
+        if (abs(rot) < 0.001f) {
+            _rectDragNormalLockX = lnx; _rectDragNormalLockY = lny
+        } else {
+            // 世界外法向 = R(rot)·局部法向
+            val cosP = cos(rot); val sinP = sin(rot)
+            _rectDragNormalLockX = lnx * cosP - lny * sinP
+            _rectDragNormalLockY = lnx * sinP + lny * cosP
+            // 带符号状态：[cAx, cAy, hxSig, hySig]（hxSig/hySig 允许负=翻转）
+            val xs = normalized.map { it.x }; val ys = normalized.map { it.y }
+            val cAx = (xs.min() + xs.max()) / 2f; val cAy = (ys.min() + ys.max()) / 2f
+            val hx0 = (xs.max() - xs.min()) / 2f; val hy0 = (ys.max() - ys.min()) / 2f
+            val hxSig = if (edgeIdx == 3) -hx0 else hx0
+            val hySig = if (edgeIdx == 0) -hy0 else hy0
+            _rectDragRotSigned = floatArrayOf(cAx, cAy, hxSig, hySig)
+            _rectDragRotLocalNx = lnx; _rectDragRotLocalNy = lny
+        }
+    }
+
+    /** 拖动帧：按锁定状态应用位移（未旋转=固定两点直移；旋转=带符号量累加，保轴对齐不变量） */
+    private fun applyLockedRectDrag(
+        p: DrawingPrimitive.RectanglePrimitive, pfoEdgeIndex: Int, amount: Float
+    ): DrawingPrimitive.RectanglePrimitive {
+        val pair = _rectDragCornerIdx
+        if (pair == null) {
+            // 锁定不可用（非单选/异常）：退回原路径保底
+            val edgeIdx = intArrayOf(0, 2, 3, 1)[pfoEdgeIndex.coerceIn(0, 3)]
+            return p.dragEdge(edgeIdx, amount)
+        }
+        val rotStat = _rectDragRotSigned
+        if (rotStat == null) {
+            // 未旋转：锁定两点沿首帧法向移动（允许交叉=负宽翻转，边身份持续）
+            val nc = p.corners.toMutableList()
+            if (nc.size == 4) {
+                val nx = _rectDragNormalLockX; val ny = _rectDragNormalLockY
+                for (k in pair) {
+                    val pt = nc[k]
+                    nc[k] = Point2D(pt.x + nx * amount, pt.y + ny * amount)
+                }
+            }
+            return p.copy(corners = nc)
+        }
+        // 旋转：边沿世界法向移 amount ⇔ 局部系：中心 += nLocal·(amount/2)；带符号半宽 += amount/2
+        val half = amount / 2f
+        val cAx = rotStat[0] + _rectDragRotLocalNx * half
+        val cAy = rotStat[1] + _rectDragRotLocalNy * half
+        val hx = rotStat[2] + (if (_rectDragRotLocalNx != 0f) half else 0f)
+        val hy = rotStat[3] + (if (_rectDragRotLocalNy != 0f) half else 0f)
+        _rectDragRotSigned = floatArrayOf(cAx, cAy, hx, hy)
+        return p.copy(corners = listOf(
+            Point2D(cAx - hx, cAy - hy), Point2D(cAx + hx, cAy - hy),
+            Point2D(cAx + hx, cAy + hy), Point2D(cAx - hx, cAy + hy)
+        ))
+    }
+
+    /** 更新"被拖边中点"（世界坐标），供 PFO 让被拖手柄跟随显示 */
+    private fun updateRectDragHandleWorld(indices: Set<Int>) {
+        val single = indices.singleOrNull()
+        val prim = single?.let { _primitives.getOrNull(it) }
+        if (prim is DrawingPrimitive.CirclePrimitive) {
+            // 圆：拖动分支内已设置"被拖顶点"的跟随位置——此处不得清空（否则 override 失效=过圆心跳变回归）
+            return
+        }
+        val p = prim as? DrawingPrimitive.RectanglePrimitive
+        if (p == null || p.corners.size != 4) { _rectDragHandleWorld.value = null; return }
+        val rot = p.rotation
+        if (abs(rot) < 0.001f) {
+            val pair = _rectDragCornerIdx ?: run { _rectDragHandleWorld.value = null; return }
+            val a = p.corners[pair[0]]; val b = p.corners[pair[1]]
+            _rectDragHandleWorld.value = Point2D((a.x + b.x) / 2f, (a.y + b.y) / 2f)
+        } else {
+            val s = _rectDragRotSigned ?: run { _rectDragHandleWorld.value = null; return }
+            // 被拖边中点（局部）：拖 x 轴边 → (cAx+hxSig, cAy)；拖 y 轴边 → (cAx, cAy+hySig)
+            val mx = if (_rectDragRotLocalNx != 0f) s[0] + s[2] else s[0]
+            val my = if (_rectDragRotLocalNy != 0f) s[1] + s[3] else s[1]
+            val cosP = cos(rot); val sinP = sin(rot)
+            val dx = mx - s[0]; val dy = my - s[1]
+            _rectDragHandleWorld.value = Point2D(s[0] + dx * cosP - dy * sinP, s[1] + dx * sinP + dy * cosP)
+        }
+    }
+
+    /** 选择变换实时生效：清除快照但保留旋转（包围盒已更新）。 */
+    fun finalizeSelectionTransform() {
+        val ts = _transformState
+        val s = _selection.value
+        // 矩形中点拖拽已直接烘焙角点，跳过快照回烘焙（否则会把角点改动退回）
+        if (ts != null && s.isTransforming && !_rectMidpointActive) {
+            val bakeEdit = PendingEdit(
+                active = true,
+                rotation = s.rotation - ts.startRotation,
+                scaleX = if (ts.startScaleX != 0f) s.selScaleX / ts.startScaleX else 1f,
+                scaleY = if (ts.startScaleY != 0f) s.selScaleY / ts.startScaleY else 1f,
+                offsetX = s.selOffsetX - ts.startOffsetX,
+                offsetY = s.selOffsetY - ts.startOffsetY,
+                bounds = s.bounds,
+                pivotX = s.bounds?.let { (it.minX + it.maxX) / 2f } ?: 0f,
+                pivotY = s.bounds?.let { (it.minY + it.maxY) / 2f } ?: 0f
+            )
+            for (i in s.selectedIndices) {
+                val p = ts.snapshot[i] ?: continue
+                if (i < _primitives.size) _primitives[i] = p.applyTransform(bakeEdit)
+            }
+        }
+        _transformState = null
+        _rectMidpointActive = false
+        clearRectDragLocks()
+        val s2 = _selection.value
+        // 平移/缩放已烘焙进基元，bounds 必须同步缩放+平移（旋转仍由选框 rotation 承担，不动 bounds），
+        // 否则 selScale/selOffset 清零后选框停留在旧尺寸/旧位置，多次缩放后图形超出 PFO
+        val bakedDx = if (ts != null) s.selOffsetX - ts.startOffsetX else 0f
+        val bakedDy = if (ts != null) s.selOffsetY - ts.startOffsetY else 0f
+        val bakedSx = if (ts != null && ts.startScaleX != 0f) s.selScaleX / ts.startScaleX else 1f
+        val bakedSy = if (ts != null && ts.startScaleY != 0f) s.selScaleY / ts.startScaleY else 1f
+        val shiftedBounds = s2.bounds?.let {
+            if (bakedDx != 0f || bakedDy != 0f || bakedSx != 1f || bakedSy != 1f) {
+                val pcx = (it.minX + it.maxX) / 2f; val pcy = (it.minY + it.maxY) / 2f
+                val hx = (it.maxX - it.minX) / 2f * bakedSx
+                val hy = (it.maxY - it.minY) / 2f * bakedSy
+                Bounds(pcx - hx + bakedDx, pcy - hy + bakedDy, pcx + hx + bakedDx, pcy + hy + bakedDy)
+            } else it
+        }
+        // 松手后按烘焙结果同步 bounds（平移+缩放已折算进 shiftedBounds），不从基元重算，
+        // 避免旋转后的 AABB 与选框 rotation 叠加造成二次旋转
+        _selection.value = s2.copy(
+            isTransforming = false,
+            initialBounds = null,
+            bounds = shiftedBounds,
+            // Keep the accumulated rotation so the selection frame stays oriented.
+            // It is NOT reset — the baked primitives carry their own intrinsic rotation
+            // which computeSelectionRotation will reflect for the next fresh selection.
+            rotation = if (s.isTransforming) s.rotation else computeSelectionRotation(s2.selectedIndices),
+            selScaleX = 1f, selScaleY = 1f,
+            selOffsetX = 0f, selOffsetY = 0f
+        )
+        autoSave()
     }
 
     // ═══════════════════════════════════════════════════════
@@ -1223,53 +2393,61 @@ class DrawingViewModel(
                 _showPropertiesDlg.value = true
                 return  // 不清除选择、不记撤销
             }
+            SelectionAction.ARRAY -> {
+                if (_selection.value.selectedIndices.isEmpty()) return
+                // 每次打开重置：1行1列（无额外拷贝）+ 默认间距，避免上次阵列太远找不到手柄
+                arrayRows.intValue = 1
+                arrayCols.intValue = 1
+                arrayGapX.floatValue = 80f
+                arrayGapY.floatValue = 80f
+                // 初始手柄方向：竖屏默认右下，横屏默认左下（其余阵列逻辑不变）
+                arrayDirX.intValue = if (_isLandscape.value) -1 else 1
+                arrayDirY.intValue = 1
+                _arrayActive.value = true
+                return  // enter array preview mode
+            }
             else -> {}
         }
         val indices = _selection.value.selectedIndices
+        if (indices.isEmpty()) return
         pushUndo()
         when (action) {
             SelectionAction.DELETE -> {
-                if (indices.isEmpty()) return
                 for (i in indices.sortedDescending()) _primitives.removeAt(i)
             }
             SelectionAction.COPY -> {
-                if (indices.isEmpty()) return
                 _clipboard.clear()
-                _clipboard.addAll(indices.map { i -> deepCopyPrimitive(_primitives[i]) })
+                _clipboard.addAll(indices.map { i -> _primitives[i].deepCopy() })
                 val beforeSize = _primitives.size
-                for (cp in _clipboard) _primitives.add(shiftPrimitive(cp, 30f, 30f))
+                for (cp in _clipboard) _primitives.add(cp.shiftPrimitive(30f, 30f))
                 val newIndices = (beforeSize until _primitives.size).toSet()
-                _selection.value = SelectionState(selectedIndices = newIndices, bounds = computeSelectionBounds(newIndices))
+                _selection.value = SelectionState(selectedIndices = newIndices, bounds = computeSelectionBounds(newIndices),
+                    rotation = computeSelectionRotation(newIndices))
                 autoSave(); return
             }
             SelectionAction.CUT -> {
-                if (indices.isEmpty()) return
                 _clipboard.clear()
-                _clipboard.addAll(indices.map { i -> deepCopyPrimitive(_primitives[i]) })
+                _clipboard.addAll(indices.map { i -> _primitives[i].deepCopy() })
                 for (i in indices.sortedDescending()) _primitives.removeAt(i)
-                val beforeSize = _primitives.size
-                for (cp in _clipboard) _primitives.add(shiftPrimitive(cp, 30f, 30f))
-                val newIndices = (beforeSize until _primitives.size).toSet()
-                _selection.value = SelectionState(selectedIndices = newIndices, bounds = computeSelectionBounds(newIndices))
+                _selection.value = SelectionState()
                 autoSave(); return
             }
-            SelectionAction.PASTE -> { pasteClipboard() }
+            SelectionAction.PASTE -> {
+                val newIndices = pasteClipboard()
+                if (newIndices.isNotEmpty()) {
+                    _selection.value = SelectionState(selectedIndices = newIndices, bounds = computeSelectionBounds(newIndices),
+                        rotation = computeSelectionRotation(newIndices))
+                }
+                autoSave(); return
+            }
             SelectionAction.MIRROR -> {
-                if (indices.isEmpty()) return
                 val bounds = computeSelectionBounds(indices) ?: return
                 val cx = (bounds.minX + bounds.maxX) / 2f
+                val cy = (bounds.minY + bounds.maxY) / 2f
+                // 横屏模式：镜像基准线从竖直轴改为水平轴（翻转 y）
                 for (i in indices) {
                     val p = _primitives[i]
-                    _primitives[i] = when (p) {
-                        is DrawingPrimitive.FreehandPath -> p.copy(points = p.points.map { Point2D(cx * 2 - it.x, it.y) })
-                        is DrawingPrimitive.RectanglePrimitive -> p.copy(startX = cx * 2 - p.startX, endX = cx * 2 - p.endX)
-                        is DrawingPrimitive.CirclePrimitive -> p.copy(centerX = cx * 2 - p.centerX, endX = cx * 2 - p.endX)
-                        is DrawingPrimitive.LinePrimitive -> p.copy(startX = cx * 2 - p.startX, endX = cx * 2 - p.endX)
-                        is DrawingPrimitive.NumberLabelPrimitive -> p.copy(x = cx * 2 - p.x)
-                        is DrawingPrimitive.TextPrimitive -> p.copy(x = cx * 2 - p.x)
-                        is DrawingPrimitive.BlockRefPrimitive -> p.copy(x = cx * 2 - p.x)
-                        else -> p
-                    }
+                    _primitives[i] = p.mirrorPrimitive(cx, cy, flipY = _isLandscape.value)
                 }
                 _selection.value = _selection.value.copy(bounds = computeSelectionBounds(indices))
                 autoSave(); return
@@ -1280,31 +2458,71 @@ class DrawingViewModel(
         autoSave()
     }
 
-    private fun pasteClipboard() {
-        if (_clipboard.isEmpty()) return
-        for (cp in _clipboard) _primitives.add(shiftPrimitive(cp, 30f, 30f))
+    /** 阵列预览中拖动原始元素：直接平移选中基元并同步 bounds（幽灵预览跟随） */
+    private var arrayDragLast: Point2D? = null
+    /** 数字/文字/区间：按下时只记位置，松手才创建基元（避免双指缩放时第一个触点闪现预览） */
+    private var labelPendingStart: Point2D? = null
+    private var arrayDragUndoPushed = false
+
+    private fun arrayDragSelected(dx: Float, dy: Float) {
+        val indices = _selection.value.selectedIndices
+        if (indices.isEmpty()) return
+        for (i in indices) {
+            val p = _primitives.getOrNull(i) ?: continue
+            _primitives[i] = p.shiftPrimitive(dx, dy)
+        }
+        val b = _selection.value.bounds
+        _selection.value = _selection.value.copy(
+            bounds = b?.let { Bounds(it.minX + dx, it.minY + dy, it.maxX + dx, it.maxY + dy) }
+        )
+        hasUnsavedChanges = true
     }
 
-    private fun deepCopyPrimitive(p: DrawingPrimitive): DrawingPrimitive = when (p) {
-        is DrawingPrimitive.FreehandPath -> p.copy()
-        is DrawingPrimitive.RectanglePrimitive -> p.copy()
-        is DrawingPrimitive.CirclePrimitive -> p.copy()
-        is DrawingPrimitive.LinePrimitive -> p.copy()
-        is DrawingPrimitive.NumberLabelPrimitive -> p.copy()
-        is DrawingPrimitive.TextPrimitive -> p.copy()
-        is DrawingPrimitive.RangeLabelPrimitive -> p.copy()
-        is DrawingPrimitive.BlockRefPrimitive -> p.copy()
+    /** Execute array: duplicate the selected primitives in rows×cols grid. */
+    fun executeArray() {
+        val indices = _selection.value.selectedIndices
+        if (indices.isEmpty()) return
+        val rows = arrayRows.intValue
+        val cols = arrayCols.intValue
+        val gapX = arrayGapX.floatValue
+        val gapY = arrayGapY.floatValue
+        val dirX = arrayDirX.intValue
+        val dirY = arrayDirY.intValue
+        // 1行1列 = 无额外拷贝，直接退出，不产生空撤销
+        if (rows * cols <= 1) { _arrayActive.value = false; return }
+        pushUndo()
+        val firstBounds = computeSelectionBounds(indices) ?: return
+        val baseW = firstBounds.maxX - firstBounds.minX
+        val baseH = firstBounds.maxY - firstBounds.minY
+        val beforeSize = _primitives.size
+        for (r in 0 until rows) {
+            for (c in 0 until cols) {
+                if (r == 0 && c == 0) continue
+                val dx = c * (baseW + gapX) * dirX
+                val dy = r * (baseH + gapY) * dirY
+                for (i in indices.sorted()) {
+                    val p = _primitives[i]
+                    _primitives.add(p.deepCopy().shiftPrimitive(dx, dy))
+                }
+            }
+        }
+        // 确认后同时选中新生成的元素和原始元素
+        val newIndices = (beforeSize until _primitives.size).toSet()
+        val all = indices + newIndices
+        _selection.value = SelectionState(selectedIndices = all, bounds = computeSelectionBounds(all))
+        _arrayActive.value = false
+        autoSave()
     }
 
-    private fun shiftPrimitive(p: DrawingPrimitive, dx: Float, dy: Float): DrawingPrimitive = when (p) {
-        is DrawingPrimitive.FreehandPath -> p.copy(points = p.points.map { Point2D(it.x + dx, it.y + dy) })
-        is DrawingPrimitive.RectanglePrimitive -> p.copy(startX = p.startX + dx, startY = p.startY + dy, endX = p.endX + dx, endY = p.endY + dy)
-        is DrawingPrimitive.CirclePrimitive -> p.copy(centerX = p.centerX + dx, centerY = p.centerY + dy, endX = p.endX + dx, endY = p.endY + dy)
-        is DrawingPrimitive.LinePrimitive -> p.copy(startX = p.startX + dx, startY = p.startY + dy, endX = p.endX + dx, endY = p.endY + dy)
-        is DrawingPrimitive.NumberLabelPrimitive -> p.copy(x = p.x + dx, y = p.y + dy)
-        is DrawingPrimitive.TextPrimitive -> p.copy(x = p.x + dx, y = p.y + dy)
-        is DrawingPrimitive.RangeLabelPrimitive -> p.copy(x = p.x + dx, y = p.y + dy)
-        is DrawingPrimitive.BlockRefPrimitive -> p.copy(x = p.x + dx, y = p.y + dy)
+    fun cancelArray() {
+        _arrayActive.value = false
+    }
+
+    private fun pasteClipboard(): Set<Int> {
+        if (_clipboard.isEmpty()) return emptySet()
+        val beforeSize = _primitives.size
+        for (cp in _clipboard) _primitives.add(cp.shiftPrimitive(30f, 30f))
+        return (beforeSize until _primitives.size).toSet()
     }
 
     // ═══════════════════════════════════════════════════════
@@ -1324,20 +2542,41 @@ class DrawingViewModel(
         return (_primitives.getOrNull(idx)?.lineScaleFactor) ?: 1f
     }
 
+    // ─── 滑块类连续调节会话：一次会话（900ms 内）= 一个 undo 步 + 延迟自动保存 ──
+    private var _sliderSessionTime = 0L
+    private var _sliderSaveJob: kotlinx.coroutines.Job? = null
+
+    private fun sliderSessionBegin() {
+        val now = System.currentTimeMillis()
+        if (now - _sliderSessionTime > 900L) pushUndo()
+        _sliderSessionTime = now
+    }
+
+    private fun sliderSessionSave() {
+        _sliderSaveJob?.cancel()
+        _sliderSaveJob = viewModelScope.launch {
+            kotlinx.coroutines.delay(900L)
+            autoSave()
+        }
+    }
+
+    /** 线型比例：把选中元素统一设为该值（连续调节合并为一次 undo、延迟保存） */
+    fun updateSelectedLineScale(value: Float) {
+        val indices = _selection.value.selectedIndices; if (indices.isEmpty()) return
+        val v = value.coerceIn(0.25f, 4f)
+        sliderSessionBegin()
+        for (i in indices.sortedDescending()) {
+            _primitives[i] = _primitives[i].withLineScaleFactor(v)
+        }
+        hasUnsavedChanges = true
+        sliderSessionSave()
+    }
+
     fun updateSelectedColor(color: Color) {
         val indices = _selection.value.selectedIndices; if (indices.isEmpty()) return
         pushUndo()
         for (i in indices.sortedDescending()) {
-            _primitives[i] = when (val p = _primitives[i]) {
-                is DrawingPrimitive.FreehandPath -> p.copy(color = color)
-                is DrawingPrimitive.RectanglePrimitive -> p.copy(color = color)
-                is DrawingPrimitive.CirclePrimitive -> p.copy(color = color)
-                is DrawingPrimitive.LinePrimitive -> p.copy(color = color)
-                is DrawingPrimitive.NumberLabelPrimitive -> p.copy(color = color)
-                is DrawingPrimitive.TextPrimitive -> p.copy(color = color)
-                is DrawingPrimitive.RangeLabelPrimitive -> p.copy(color = color)
-                is DrawingPrimitive.BlockRefPrimitive -> p.copy(color = color)
-            }
+            _primitives[i] = _primitives[i].withColor(color)
         }; autoSave()
     }
 
@@ -1345,46 +2584,64 @@ class DrawingViewModel(
         val indices = _selection.value.selectedIndices; if (indices.isEmpty()) return
         pushUndo()
         for (i in indices.sortedDescending()) {
-            _primitives[i] = when (val p = _primitives[i]) {
-                is DrawingPrimitive.FreehandPath -> p.copy(lineStyle = style)
-                is DrawingPrimitive.RectanglePrimitive -> p.copy(lineStyle = style)
-                is DrawingPrimitive.CirclePrimitive -> p.copy(lineStyle = style)
-                is DrawingPrimitive.LinePrimitive -> p.copy(lineStyle = style)
-                is DrawingPrimitive.BlockRefPrimitive -> p.copy(lineStyle = style)
+            val p = _primitives[i]
+            // 只换线型，保留每个元素自己的虚线间隔
+            val ns = p.lineStyle.copy(type = style.type)
+            _primitives[i] = when (p) {
+                is DrawingPrimitive.FreehandPath -> p.copy(lineStyle = ns)
+                is DrawingPrimitive.RectanglePrimitive -> p.copy(lineStyle = ns)
+                is DrawingPrimitive.CirclePrimitive -> p.copy(lineStyle = ns)
+                is DrawingPrimitive.LinePrimitive -> p.copy(lineStyle = ns)
+                is DrawingPrimitive.BlockRefPrimitive -> p.copy(lineStyle = ns)
                 else -> p
             }
         }; autoSave()
     }
 
-    fun updateSelectedLineScaleFactor(factor: Float) {
+    /** 虚线间距倍率（1× = 默认 12/8）：无选中时改当前线型，之后画的虚线生效 */
+    fun setCurrentDashScale(mult: Float) {
+        val m = mult.coerceIn(0.5f, 5f)
+        _currentLineStyle.value = _currentLineStyle.value.copy(
+            dashLength = 12f * m, gapLength = 8f * m
+        )
+        saveSettings()
+    }
+
+    /** 虚线间距倍率：有选中时逐元素改间隔（连续调节合并 undo、延迟保存） */
+    fun updateSelectedDashScale(mult: Float) {
         val indices = _selection.value.selectedIndices; if (indices.isEmpty()) return
-        pushUndo()
-        val clamped = factor.coerceIn(0.25f, 4f)
+        val m = mult.coerceIn(0.5f, 5f)
+        sliderSessionBegin()
         for (i in indices.sortedDescending()) {
-            _primitives[i] = when (val p = _primitives[i]) {
-                is DrawingPrimitive.FreehandPath -> p.copy(lineScaleFactor = clamped)
-                is DrawingPrimitive.RectanglePrimitive -> p.copy(lineScaleFactor = clamped)
-                is DrawingPrimitive.CirclePrimitive -> p.copy(lineScaleFactor = clamped)
-                is DrawingPrimitive.LinePrimitive -> p.copy(lineScaleFactor = clamped)
-                is DrawingPrimitive.NumberLabelPrimitive -> p.copy(lineScaleFactor = clamped)
-                is DrawingPrimitive.TextPrimitive -> p.copy(lineScaleFactor = clamped)
-                is DrawingPrimitive.RangeLabelPrimitive -> p.copy(lineScaleFactor = clamped)
-                is DrawingPrimitive.BlockRefPrimitive -> p.copy(lineScaleFactor = clamped)
+            val p = _primitives[i]
+            val ls = p.lineStyle.copy(dashLength = 12f * m, gapLength = 8f * m)
+            _primitives[i] = when (p) {
+                is DrawingPrimitive.FreehandPath -> p.copy(lineStyle = ls)
+                is DrawingPrimitive.RectanglePrimitive -> p.copy(lineStyle = ls)
+                is DrawingPrimitive.CirclePrimitive -> p.copy(lineStyle = ls)
+                is DrawingPrimitive.LinePrimitive -> p.copy(lineStyle = ls)
+                is DrawingPrimitive.BlockRefPrimitive -> p.copy(lineStyle = ls)
+                else -> p
             }
-        }; autoSave()
+        }
+        hasUnsavedChanges = true
+        sliderSessionSave()
     }
 
     fun updateSelectedFontSize(fontSize: Float) {
         val indices = _selection.value.selectedIndices; if (indices.isEmpty()) return
-        pushUndo()
-        val clamped = fontSize.coerceIn(30f, 600f)
+        sliderSessionBegin()
+        val clamped = fontSize.coerceIn(20f, 600f)
         for (i in indices.sortedDescending()) {
             when (val p = _primitives[i]) {
                 is DrawingPrimitive.NumberLabelPrimitive -> _primitives[i] = p.copy(fontSize = clamped)
                 is DrawingPrimitive.TextPrimitive -> _primitives[i] = p.copy(fontSize = clamped)
+                is DrawingPrimitive.RangeLabelPrimitive -> _primitives[i] = p.copy(fontSize = clamped)
                 else -> {}
             }
-        }; autoSave()
+        }
+        hasUnsavedChanges = true
+        sliderSessionSave()
     }
 
     fun updateSelectedTextContent(text: String) {
@@ -1393,7 +2650,13 @@ class DrawingViewModel(
         for (i in indices.sortedDescending()) {
             val p = _primitives[i]
             if (p is DrawingPrimitive.TextPrimitive) _primitives[i] = p.copy(text = text)
-        }; autoSave()
+        }
+        // 文字宽度随内容变化，选择框必须同步重算，否则框停在旧尺寸
+        _selection.value = _selection.value.copy(
+            bounds = computeSelectionBounds(indices),
+            rotation = computeSelectionRotation(indices)
+        )
+        autoSave()
     }
 
     fun updateSelectedNumberValue(value: Int) {
@@ -1405,10 +2668,32 @@ class DrawingViewModel(
         }; autoSave()
     }
 
-    fun updateSelectedBlockScale(scale: Float) {
+    fun updateSelectedCircled(circled: Boolean) {
         val indices = _selection.value.selectedIndices; if (indices.isEmpty()) return
         pushUndo()
-        val clamped = scale.coerceIn(0.1f, 10f)
+        for (i in indices.sortedDescending()) {
+            val p = _primitives[i]
+            if (p is DrawingPrimitive.NumberLabelPrimitive) _primitives[i] = p.copy(circled = circled)
+        }; autoSave()
+    }
+
+    /** 区间数字朝向：false = 朝下（正向），true = 朝左（数字下方朝屏幕左边） */
+    fun updateSelectedRangeNumbersFaceLeft(faceLeft: Boolean) {
+        val indices = _selection.value.selectedIndices; if (indices.isEmpty()) return
+        pushUndo()
+        for (i in indices.sortedDescending()) {
+            val p = _primitives[i]
+            if (p is DrawingPrimitive.RangeLabelPrimitive) _primitives[i] = p.copy(numbersFaceLeft = faceLeft)
+        }; autoSave()
+    }
+
+    fun updateSelectedBlockScale(scale: Float) {
+        val indices = _selection.value.selectedIndices; if (indices.isEmpty()) return
+        // 滑块连续拖动只压一次撤销快照（与工具栏线宽滑块同机制）
+        pushSelectionAdjustUndo()
+        // 块 scale 是绝对系数，不设业务上限：矩形等图元把几何写回角点，能反复放大累积，
+        // 块也必须一致（旧值 0.1~10 会让块永远卡在 10 倍）。只防数值退化。
+        val clamped = if (scale.isFinite()) scale.coerceIn(1e-4f, 1e6f) else 1f
         for (i in indices.sortedDescending()) {
             val p = _primitives[i]
             if (p is DrawingPrimitive.BlockRefPrimitive) _primitives[i] = p.copy(scale = clamped)
@@ -1418,24 +2703,8 @@ class DrawingViewModel(
     // ═══════════════════════════════════════════════════════
     //  文字工具
     // ═══════════════════════════════════════════════════════
-
-    fun addTextAtCenter(screenWidth: Float, screenHeight: Float, horizontalOnly: Boolean = false) {
-        val txt = _pendingTextContent.value.ifBlank { "文字" }
-        val centerX = (screenWidth / 2f - _canvasOffsetX.value) / _canvasScale.value
-        val centerY = (screenHeight / 2f - _canvasOffsetY.value) / _canvasScale.value
-        val initRotation = if (horizontalOnly) 0f else (Math.PI / 2).toFloat()
-        _pendingEdit.value = PendingEdit(
-            active = true,
-            primitive = DrawingPrimitive.TextPrimitive(
-                text = txt, x = centerX, y = centerY,
-                fontSize = _lastTextFontSize, color = _currentColor.value,
-                strokeWidth = _currentStrokeWidth.value, layerId = _activeLayerId.value,
-                horizontalOnly = horizontalOnly, rotation = initRotation
-            ),
-            bounds = Bounds(centerX - 80f, centerY - 40f, centerX + 80f, centerY + 40f)
-        )
-        _currentTool.value = _previousTool.value
-    }
+    // 文字在对话框确定后只记录内容/方向（setPendingTextContent / setTextOrientation），
+    // 等用户点击屏幕时由 startPrimitive(ToolType.TEXT) 在点击处放置，不主动出现在屏幕上。
 
     // ═══════════════════════════════════════════════════════
     //  图块
@@ -1456,19 +2725,81 @@ class DrawingViewModel(
         val draft = _blockDraft.value ?: return false
         if (draft.primitives.isEmpty()) return false
         val id = "block_${System.currentTimeMillis()}"
-        _blockDefs.add(BlockDef(id = id, name = name, primitives = draft.primitives.toList(), snapPoints = draft.snapPoints.toList()))
+        val bounds = computeBlockBounds(draft.primitives)
+        _blockDefs.add(BlockDef(id = id, name = name, primitives = draft.primitives.toList(), snapPoints = draft.snapPoints.toList(), bounds = bounds))
         _blockDraft.value = null; _currentTool.value = ToolType.SELECT
         return true
     }
 
     fun cancelBlockDraft() { _blockDraft.value = null; _editingBlockId.value = null; _currentTool.value = ToolType.SELECT }
 
+    // ─── DXF 导入 ───
+    /** 已确认待放置的导入基元：主画布下一次点击时以点击点为包围盒中心放置 */
+    private val _pendingImportPrims = mutableStateOf<List<DrawingPrimitive>?>(null)
+    val pendingImportPrims: List<DrawingPrimitive>? get() = _pendingImportPrims.value
+    fun setPendingImport(prims: List<DrawingPrimitive>) { _pendingImportPrims.value = prims }
+    fun clearPendingImport() { _pendingImportPrims.value = null }
+
+    /** DXF 导入到块：导入基元直接放入块编辑画布（归一到块内默认图层 1） */
+    fun enterBlockEditorWithImport(prims: List<DrawingPrimitive>) {
+        enterBlockEditor()
+        for (p in prims) _blockEditorPrimitives.add(p.withLayerId(1))
+        _currentTool.value = ToolType.SELECT
+        blockEditorFitPending = true
+    }
+
+    /** 块编辑器进入时按内容适配视图（由 BlockEditorScreen 首帧布局触发并复位） */
+    var blockEditorFitPending = false
+    fun fitBlockEditorViewToContent(w: Float, h: Float) {
+        val b = computeBlockBounds(_blockEditorPrimitives) ?: return
+        val cw = maxOf(b.maxX - b.minX, 1f); val ch = maxOf(b.maxY - b.minY, 1f)
+        val sp = 60f
+        val ns = minOf((w - 2 * sp) / cw, (h - 2 * sp) / ch).coerceIn(0.01f, 50f)
+        _blockEditorViewScale.value = ns
+        _blockEditorViewX.value = w / 2f - (b.minX + b.maxX) / 2f * ns
+        _blockEditorViewY.value = h / 2f - (b.minY + b.maxY) / 2f * ns
+    }
+
+    /** 在 startPrimitive 最前面调用：有待放置导入内容时，以点击点为中心放置并全选 */
+    private fun placePendingImport(start: Point2D): Boolean {
+        val prims = _pendingImportPrims.value ?: return false
+        if (prims.isNotEmpty()) {
+            // 整体包围盒中心 → 点击点
+            var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE
+            var maxX = -Float.MAX_VALUE; var maxY = -Float.MAX_VALUE
+            var has = false
+            for (p in prims) {
+                val b = p.computeBounds(boundsMeasurePaint) ?: continue
+                has = true
+                minX = minOf(minX, b[0]); minY = minOf(minY, b[1])
+                maxX = maxOf(maxX, b[2]); maxY = maxOf(maxY, b[3])
+            }
+            val dx = if (has) start.x - (minX + maxX) / 2f else 0f
+            val dy = if (has) start.y - (minY + maxY) / 2f else 0f
+            pushUndo()
+            val beforeSize = _primitives.size
+            // 导入内容落到当前活动层（活动层必为可见层），避免 layerId 悬空导致不可见/不可擦除
+            for (p in prims) _primitives.add(p.shiftPrimitive(dx, dy).withLayerId(_activeLayerId.value))
+            val newIndices = (beforeSize until _primitives.size).toSet()
+            _selection.value = SelectionState(
+                selectedIndices = newIndices,
+                bounds = computeSelectionBounds(newIndices),
+                rotation = computeSelectionRotation(newIndices)
+            )
+            setTool(ToolType.SELECT)
+            hasUnsavedChanges = true
+            autoSave()
+        }
+        _pendingImportPrims.value = null
+        return true
+    }
+
     private fun computeBlockBounds(primitives: List<DrawingPrimitive>): Bounds? {
         var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE
         var maxX = -Float.MAX_VALUE; var maxY = -Float.MAX_VALUE
         var hasAny = false
         for (p in primitives) {
-            val b = computeBounds(p) ?: continue
+            val b = p.computeBounds(boundsMeasurePaint) ?: continue
             hasAny = true
             minX = minOf(minX, b[0]); minY = minOf(minY, b[1])
             maxX = maxOf(maxX, b[2]); maxY = maxOf(maxY, b[3])
@@ -1507,16 +2838,24 @@ class DrawingViewModel(
         val realBounds = computeBlockBounds(blockDef.primitives)
         val halfW = realBounds?.let { (it.maxX - it.minX) / 2f } ?: 50f
         val halfH = realBounds?.let { (it.maxY - it.minY) / 2f } ?: 50f
+        // 渲染时块内容形心落在锚点（drawBlockRef）：反推锚点，使内容包围盒中心正对屏幕中心
+        val centroid = blockContentCentroid(blockDef.primitives)
+        val ax = if (realBounds != null && centroid != null)
+            vx - ((realBounds.minX + realBounds.maxX) / 2f - centroid.x) else vx
+        val ay = if (realBounds != null && centroid != null)
+            vy - ((realBounds.minY + realBounds.maxY) / 2f - centroid.y) else vy
         _pendingEdit.value = PendingEdit(
             active = true,
             primitive = DrawingPrimitive.BlockRefPrimitive(
-                blockDefId = blockDef.id, x = vx, y = vy,
+                blockDefId = blockDef.id, x = ax, y = ay,
                 scale = 1f, rotation = 0f, snapPointIndex = -1,
                 color = _currentColor.value, strokeWidth = _currentStrokeWidth.value,
                 layerId = _activeLayerId.value, lineStyle = _currentLineStyle.value
             ),
             bounds = Bounds(vx - halfW, vy - halfH, vx + halfW, vy + halfH),
-            scaleX = 1f, scaleY = 1f
+            scaleX = 1f, scaleY = 1f,
+            // PFO 旋转轴必须给：BlockRef 在浮层里算不出元素中心，缺省会退到世界原点导致框飞出屏幕
+            pivotX = vx, pivotY = vy
         )
         return true
     }
@@ -1570,7 +2909,7 @@ class DrawingViewModel(
             val tol = 40f / _blockEditorViewScale.value
             var bestIdx = -1; var bestDist = Float.MAX_VALUE
             for ((i, p) in _blockEditorPrimitives.withIndex()) {
-                val dist = pointToPrimitiveDist(start, p)
+                val dist = p.distanceTo(start)
                 if (dist < bestDist) { bestDist = dist; bestIdx = i }
             }
             _blockEditorSelectedIndex.value = if (bestIdx >= 0 && bestDist < tol) bestIdx else -1
@@ -1579,8 +2918,10 @@ class DrawingViewModel(
         _blockEditorCurrent.value = when (_currentTool.value) {
             ToolType.FREEHAND -> DrawingPrimitive.FreehandPath(points = listOf(start), color = _currentColor.value,
                 strokeWidth = _currentStrokeWidth.value, layerId = 1, lineStyle = _currentLineStyle.value)
-            ToolType.RECTANGLE -> DrawingPrimitive.RectanglePrimitive(startX = start.x, startY = start.y,
-                endX = start.x, endY = start.y, color = _currentColor.value,
+            ToolType.RECTANGLE -> DrawingPrimitive.RectanglePrimitive(corners = listOf(
+                Point2D(start.x, start.y), Point2D(start.x, start.y),
+                Point2D(start.x, start.y), Point2D(start.x, start.y)),
+                color = _currentColor.value,
                 strokeWidth = _currentStrokeWidth.value, layerId = 1, lineStyle = _currentLineStyle.value)
             ToolType.CIRCLE -> DrawingPrimitive.CirclePrimitive(centerX = start.x, centerY = start.y,
                 endX = start.x, endY = start.y, color = _currentColor.value,
@@ -1594,64 +2935,42 @@ class DrawingViewModel(
 
     private fun blockEditorPerformErasure(point: Point2D) {
         _eraserTouchPoint.value = point
-        val tol = 30f / _blockEditorViewScale.value  // larger tolerance in world units
-        // Find the nearest primitive edge to the touch point
-        var bestIdx = -1; var bestDist = Float.MAX_VALUE
+        val rSq = _eraserRadius.value * _eraserRadius.value
+        val toRemove = mutableListOf<Int>()
+        val toAdd = mutableListOf<DrawingPrimitive>()
         for ((i, p) in _blockEditorPrimitives.withIndex()) {
-            val dist = pointToPrimitiveDist(point, p)
-            if (dist < bestDist) { bestDist = dist; bestIdx = i }
+            when (p) {
+                is DrawingPrimitive.FreehandPath -> {
+                    if (!eraserHitBounds(p, point, rSq)) continue
+                    if (shapeHitByEraser(p.points, point, rSq, isClosed = p.isClosed)) {
+                        toRemove.add(i)
+                        if (_fineEraseEnabled.value) {
+                            val segments = splitFreehand(p.points, point, rSq, isClosed = p.isClosed)
+                            for (seg in segments) {
+                                if (seg.size >= 2) toAdd.add(p.copy(points = seg, isClosed = false,
+                                    sharpCorners = remapSharpCorners(p.points, p.sharpCorners, seg)))
+                            }
+                        }
+                    }
+                }
+                else -> {
+                    val dist = p.distanceTo(point)
+                    if (dist < _eraserRadius.value) {
+                        toRemove.add(i)
+                    }
+                }
+            }
         }
-        if (bestIdx >= 0 && bestDist < tol) {
+        if (toRemove.isNotEmpty() || toAdd.isNotEmpty()) {
             _blockEditorUndoHistory.add(_blockEditorPrimitives.toList())
+            if (_blockEditorUndoHistory.size > MAX_UNDO_HISTORY) _blockEditorUndoHistory.removeAt(0)
             _blockEditorRedoHistory.clear()
-            _blockEditorPrimitives.removeAt(bestIdx)
+            for (idx in toRemove.sortedDescending()) _blockEditorPrimitives.removeAt(idx)
+            _blockEditorPrimitives.addAll(toAdd)
             _blockEditorSelectedIndex.value = -1
             _canBlockEditorUndo.value = true; _canBlockEditorRedo.value = false
         }
     }
-
-    /** Point-to-primitive distance: min distance to any segment/edge */
-    private fun pointToPrimitiveDist(point: Point2D, p: DrawingPrimitive): Float {
-        return when (p) {
-            is DrawingPrimitive.FreehandPath -> {
-                if (p.points.size < 2) Float.MAX_VALUE
-                else p.points.zipWithNext().minOf { (a, b) -> distToSegment(point, a, b) }
-            }
-            is DrawingPrimitive.LinePrimitive -> distToSegment(point,
-                Point2D(p.startX, p.startY), Point2D(p.endX, p.endY))
-            is DrawingPrimitive.RectanglePrimitive -> {
-                val x1 = minOf(p.startX, p.endX); val y1 = minOf(p.startY, p.endY)
-                val x2 = maxOf(p.startX, p.endX); val y2 = maxOf(p.startY, p.endY)
-                val corners = listOf(
-                    Point2D(x1, y1), Point2D(x2, y1), Point2D(x2, y2), Point2D(x1, y2)
-                )
-                (corners + corners.first()).zipWithNext().minOf { (a, b) -> distToSegment(point, a, b) }
-            }
-            is DrawingPrimitive.CirclePrimitive -> {
-                val r = maxOf(abs(p.endX - p.centerX), abs(p.endY - p.centerY))
-                val dc = sqrt((point.x - p.centerX).squared() + (point.y - p.centerY).squared())
-                abs(dc - r)
-            }
-            is DrawingPrimitive.NumberLabelPrimitive -> distToSegment(point,
-                Point2D(p.x - 30f, p.y), Point2D(p.x + 30f, p.y))
-            is DrawingPrimitive.TextPrimitive -> distToSegment(point,
-                Point2D(p.x - 40f, p.y), Point2D(p.x + 40f, p.y))
-            else -> Float.MAX_VALUE
-        }
-    }
-
-    /** Distance from point to line segment AB */
-    private fun distToSegment(pt: Point2D, a: Point2D, b: Point2D): Float {
-        val abx = b.x - a.x; val aby = b.y - a.y
-        val lenSq = abx * abx + aby * aby
-        if (lenSq < 0.0001f) return sqrt((pt.x - a.x).squared() + (pt.y - a.y).squared())
-        var t = ((pt.x - a.x) * abx + (pt.y - a.y) * aby) / lenSq
-        t = t.coerceIn(0f, 1f)
-        val px = a.x + t * abx; val py = a.y + t * aby
-        return sqrt((pt.x - px).squared() + (pt.y - py).squared())
-    }
-
-    private fun Float.squared() = this * this
 
     fun blockEditorUpdatePrimitive(point: Point2D) {
         if (_currentTool.value == ToolType.ERASER) {
@@ -1661,14 +2980,21 @@ class DrawingViewModel(
         _blockEditorCurrent.value = when (val cp = _blockEditorCurrent.value) {
             is DrawingPrimitive.FreehandPath -> cp.copy(points = cp.points + point)
             is DrawingPrimitive.RectanglePrimitive -> {
+                val sx = cp.corners[0].x; val sy = cp.corners[0].y
                 if (_rectangleSquareMode.value) {
-                    val dx = point.x - cp.startX
-                    val dy = point.y - cp.startY
+                    val dx = point.x - sx; val dy = point.y - sy
                     val side = maxOf(abs(dx), abs(dy))
-                    val sx = if (dx > 0) 1f else if (dx < 0) -1f else 0f
-                    val sy = if (dy > 0) 1f else if (dy < 0) -1f else 0f
-                    cp.copy(endX = cp.startX + sx * side, endY = cp.startY + sy * side)
-                } else cp.copy(endX = point.x, endY = point.y)
+                    val sgnX = if (dx > 0) 1f else if (dx < 0) -1f else 0f
+                    val sgnY = if (dy > 0) 1f else if (dy < 0) -1f else 0f
+                    val ex = sx + sgnX * side; val ey = sy + sgnY * side
+                    cp.copy(corners = listOf(
+                        Point2D(sx, sy), Point2D(ex, sy),
+                        Point2D(ex, ey), Point2D(sx, ey)
+                    ))
+                } else cp.copy(corners = listOf(
+                    Point2D(sx, sy), Point2D(point.x, sy),
+                    Point2D(point.x, point.y), Point2D(sx, point.y))
+                )
             }
             is DrawingPrimitive.CirclePrimitive -> {
                 if (_circleCircleMode.value) {
@@ -1696,19 +3022,20 @@ class DrawingViewModel(
     }
 
     fun blockEditorCommitPrimitive() {
-        if (_currentTool.value == ToolType.ERASER) { _eraserTouchPoint.value = null; exitTemporaryEraser(); return }
+        if (_currentTool.value == ToolType.ERASER) { _eraserTouchPoint.value = null; return }
         val cp = _blockEditorCurrent.value ?: return
         _blockEditorCurrent.value = null
         // 手绘线直接提交
         if (cp is DrawingPrimitive.FreehandPath) {
             if (cp.points.size < 3) return
             _blockEditorUndoHistory.add(_blockEditorPrimitives.toList())
+            if (_blockEditorUndoHistory.size > MAX_UNDO_HISTORY) _blockEditorUndoHistory.removeAt(0)
             _blockEditorRedoHistory.clear()
             _blockEditorPrimitives.add(cp)
             _canBlockEditorUndo.value = true; _canBlockEditorRedo.value = false
         } else {
             // 其他图形进入 PendingEdit 预览
-            val arr = computeBounds(cp)
+            val arr = cp.computeBounds(boundsMeasurePaint)
             val bounds = if (arr != null) Bounds(arr[0], arr[1], arr[2], arr[3]) else Bounds(0f, 0f, 100f, 100f)
             _blockEditorPendingEdit.value = PendingEdit(
                 active = true, primitive = cp, bounds = bounds,
@@ -1723,8 +3050,9 @@ class DrawingViewModel(
         _blockEditorPendingEdit.value = pe.copy(offsetX = pe.offsetX + dx, offsetY = pe.offsetY + dy)
     }
 
-    fun blockEditorUpdatePendingRotation(r: Float) {
-        _blockEditorPendingEdit.value = _blockEditorPendingEdit.value.copy(rotation = r)
+    fun blockEditorUpdatePendingRotation(delta: Float) {
+        val pe = _blockEditorPendingEdit.value
+        _blockEditorPendingEdit.value = pe.copy(rotation = pe.rotation + delta)
     }
 
     fun blockEditorUpdatePendingScale(sx: Float, sy: Float) {
@@ -1735,12 +3063,21 @@ class DrawingViewModel(
         )
     }
 
+    /** 块编辑器内直接改写待确认基元（直线端点拖动等）；主画布同名逻辑见 [updatePendingPrimitive]。 */
+    fun blockEditorUpdatePendingPrimitive(primitive: DrawingPrimitive) {
+        val pe = _blockEditorPendingEdit.value
+        val b = primitive.computeBounds(boundsMeasurePaint)
+        val bounds = if (b != null) Bounds(b[0], b[1], b[2], b[3]) else pe.bounds ?: Bounds(0f, 0f, 100f, 100f)
+        _blockEditorPendingEdit.value = pe.copy(primitive = primitive, bounds = bounds)
+    }
+
     fun blockEditorConfirmPendingEdit() {
         val pe = _blockEditorPendingEdit.value
         if (!pe.isActive() || pe.primitive == null) return
         _blockEditorUndoHistory.add(_blockEditorPrimitives.toList())
+        if (_blockEditorUndoHistory.size > MAX_UNDO_HISTORY) _blockEditorUndoHistory.removeAt(0)
         _blockEditorRedoHistory.clear()
-        _blockEditorPrimitives.add(pe.primitive!!)
+        _blockEditorPrimitives.add(pe.primitive!!.applyTransform(pe))
         _blockEditorPendingEdit.value = PendingEdit()
         _canBlockEditorUndo.value = true; _canBlockEditorRedo.value = false
     }
@@ -1767,6 +3104,7 @@ class DrawingViewModel(
         _blockEditorCurrent.value = null
         _blockEditorPendingEdit.value = PendingEdit()
         _blockEditorUndoHistory.add(_blockEditorPrimitives.toList())
+        if (_blockEditorUndoHistory.size > MAX_UNDO_HISTORY) _blockEditorUndoHistory.removeAt(0)
         _blockEditorPrimitives.clear()
         _blockEditorPrimitives.addAll(_blockEditorRedoHistory.removeLast())
         _canBlockEditorUndo.value = true
@@ -1778,6 +3116,7 @@ class DrawingViewModel(
     // ═══════════════════════════════════════════════════════
 
     fun addLayer(name: String) {
+        pushUndo()
         val newId = (_layers.maxOfOrNull { it.id } ?: 0) + 1
         // 新图层插入到当前选中图层之上
         val activeIdx = _layers.indexOfFirst { it.id == _activeLayerId.value }
@@ -1790,55 +3129,70 @@ class DrawingViewModel(
 
     fun duplicateLayer(id: Int) {
         val src = _layers.find { it.id == id } ?: return
-        if (id == 0) return  // 图层0不可复制
         pushUndo()
         val newId = (_layers.maxOfOrNull { it.id } ?: 0) + 1
         val srcIdx = _layers.indexOfFirst { it.id == id }
         val insertAt = if (srcIdx >= 0) srcIdx else _layers.size
-        _layers.add(insertAt, Layer(id = newId, name = "${src.name}(1)"))
-        _activeLayerId.value = newId
+        // 复制源层属性（颜色/显隐/锁定）
+        _layers.add(insertAt, Layer(id = newId, name = "${src.name}(1)",
+            color = src.color, isVisible = src.isVisible, isLocked = src.isLocked))
+        // 副本可见才切换活动层（隐藏副本保持当前活动层，避免盲画）
+        if (src.isVisible) _activeLayerId.value = newId
         // 复制源图层的所有基元
         for (p in _primitives.filter { it.layerId == id }) {
-            _primitives.add(when (p) {
-                is DrawingPrimitive.FreehandPath -> p.copy(layerId = newId)
-                is DrawingPrimitive.RectanglePrimitive -> p.copy(layerId = newId)
-                is DrawingPrimitive.CirclePrimitive -> p.copy(layerId = newId)
-                is DrawingPrimitive.LinePrimitive -> p.copy(layerId = newId)
-                is DrawingPrimitive.NumberLabelPrimitive -> p.copy(layerId = newId)
-                is DrawingPrimitive.TextPrimitive -> p.copy(layerId = newId)
-                is DrawingPrimitive.RangeLabelPrimitive -> p.copy(layerId = newId)
-                is DrawingPrimitive.BlockRefPrimitive -> p.copy(layerId = newId)
-            })
+            _primitives.add(p.withLayerId(newId))
         }
     }
 
     fun mergeLayers(srcId: Int, dstId: Int) {
+        pushUndo()
         for (i in _primitives.indices) {
             val p = _primitives[i]
-            if (p.layerId == srcId) _primitives[i] = when (p) {
-                is DrawingPrimitive.FreehandPath -> p.copy(layerId = dstId)
-                is DrawingPrimitive.RectanglePrimitive -> p.copy(layerId = dstId)
-                is DrawingPrimitive.CirclePrimitive -> p.copy(layerId = dstId)
-                is DrawingPrimitive.LinePrimitive -> p.copy(layerId = dstId)
-                is DrawingPrimitive.NumberLabelPrimitive -> p.copy(layerId = dstId)
-                is DrawingPrimitive.TextPrimitive -> p.copy(layerId = dstId)
-                is DrawingPrimitive.RangeLabelPrimitive -> p.copy(layerId = dstId)
-                is DrawingPrimitive.BlockRefPrimitive -> p.copy(layerId = dstId)
-            }
+            if (p.layerId == srcId) _primitives[i] = p.withLayerId(dstId)
         }
-        deleteLayer(srcId)
+        removeLayerInternal(srcId)  // 不重复记撤销
     }
 
     fun toggleLayerVisibility(id: Int) {
         if (id == 0) return  // 图层0不可隐藏
         val idx = _layers.indexOfFirst { it.id == id }
-        if (idx >= 0) _layers[idx] = _layers[idx].copy(isVisible = !_layers[idx].isVisible)
+        if (idx < 0) return
+        val layer = _layers[idx]
+        if (layer.isVisible && id == _activeLayerId.value) {
+            // 隐藏当前活动层：活动层切换到最近的可见层；没有其他可见层则拒绝隐藏
+            val fallback = _layers.withIndex()
+                .filter { it.value.id != id && it.value.isVisible }
+                .minByOrNull { abs(it.index - idx) } ?: return
+            pushUndo()
+            _layers[idx] = layer.copy(isVisible = false)
+            _activeLayerId.value = fallback.value.id
+        } else {
+            pushUndo()
+            _layers[idx] = layer.copy(isVisible = !layer.isVisible)
+        }
+        // 隐藏后把该层基元从选择集剔除，避免误删/误移动不可见元素
+        if (!_layers[idx].isVisible) {
+            val sel = _selection.value.selectedIndices
+            val pruned = sel.filter { _primitives.getOrNull(it)?.layerId != id }.toSet()
+            if (pruned.size != sel.size) {
+                _selection.value = _selection.value.copy(
+                    selectedIndices = pruned,
+                    bounds = computeSelectionBounds(pruned),
+                    rotation = computeSelectionRotation(pruned)
+                )
+            }
+        }
     }
 
     fun deleteLayer(id: Int) {
         if (id == 0) return  // 图层0不可删除
         if (_layers.size <= 1) return
         pushUndo()
+        removeLayerInternal(id)
+    }
+
+    /** 删除图层及其基元，不记撤销（由调用方统一记） */
+    private fun removeLayerInternal(id: Int) {
         _layers.removeAll { it.id == id }
         _primitives.removeAll { it.layerId == id }
         if (_activeLayerId.value == id) _activeLayerId.value = _layers.first().id
@@ -1864,26 +3218,17 @@ class DrawingViewModel(
         val belowId = _layers[belowIdx].id
         // 记撤销
         pushUndo()
-        redoHistory.clear(); _canRedo.value = false
         // 把当前层的所有基元移到下层
         for (i in _primitives.indices) {
             val p = _primitives[i]
-            if (p.layerId == id) _primitives[i] = when (p) {
-                is DrawingPrimitive.FreehandPath -> p.copy(layerId = belowId)
-                is DrawingPrimitive.RectanglePrimitive -> p.copy(layerId = belowId)
-                is DrawingPrimitive.CirclePrimitive -> p.copy(layerId = belowId)
-                is DrawingPrimitive.LinePrimitive -> p.copy(layerId = belowId)
-                is DrawingPrimitive.NumberLabelPrimitive -> p.copy(layerId = belowId)
-                is DrawingPrimitive.TextPrimitive -> p.copy(layerId = belowId)
-                is DrawingPrimitive.RangeLabelPrimitive -> p.copy(layerId = belowId)
-                is DrawingPrimitive.BlockRefPrimitive -> p.copy(layerId = belowId)
-            }
+            if (p.layerId == id) _primitives[i] = p.withLayerId(belowId)
         }
-        deleteLayer(id)
+        removeLayerInternal(id)  // 不重复记撤销
         _activeLayerId.value = belowId
     }
 
     fun renameLayer(id: Int, name: String) {
+        pushUndo()
         val idx = _layers.indexOfFirst { it.id == id }
         if (idx >= 0) _layers[idx] = _layers[idx].copy(name = name)
     }
@@ -1898,6 +3243,7 @@ class DrawingViewModel(
         redoHistory.add(takeSnapshot())
         restoreSnapshot(undoHistory.removeLast())
         _canUndo.value = undoHistory.isNotEmpty(); _canRedo.value = true
+        _transformState = null; _eraserUndoPushed = false
     }
 
     fun redo() {
@@ -1906,6 +3252,7 @@ class DrawingViewModel(
         undoHistory.add(takeSnapshot())
         restoreSnapshot(redoHistory.removeLast())
         _canUndo.value = true; _canRedo.value = redoHistory.isNotEmpty()
+        _transformState = null; _eraserUndoPushed = false
     }
 
     fun clearAll() {
@@ -1918,11 +3265,65 @@ class DrawingViewModel(
     //  文件输入输出
     // ═══════════════════════════════════════════════════════
 
-    fun autoSave() {
-        val f = _documentFile ?: return
-        val doc = buildDocument()
-        storageManager.saveToFile(f, doc)
+    // ─── 自动保存：后台单线程 + 合并，避免在主线程做整图序列化 ───
+    // 单线程保证落盘顺序 = 提交顺序（后写的状态一定是最新的）；
+    // 合并（同一时刻只保留最新一份待写文档）避免连续操作把队列堆爆。
+    // 目标文件在入队时就固定下来：排队期间用户可能已经切到别的图纸，
+    // 放到执行时再读 _documentFile 会把旧文档写进新文件。
+    private val saveExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "scheda-save").also { it.isDaemon = true }
     }
+    private val pendingSave = java.util.concurrent.atomic.AtomicReference<Pair<java.io.File, com.scheda.app.model.SchedaDocument>?>(null)
+    private val saveRunning = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    // 防抖：拖动线宽/透明度这类滑条会按帧触发 autoSave，
+    // 每帧都在主线程重建文档（要遍历整个撤销历史池）会卡顿，合并成一次。
+    private val saveHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val saveTick = Runnable { enqueueCurrentDocument() }
+
+    private fun enqueueCurrentDocument() {
+        val f = _documentFile ?: return
+        pendingSave.set(f to buildDocument())
+        enqueuePendingSave()
+    }
+
+    private fun enqueuePendingSave() {
+        if (!saveRunning.compareAndSet(false, true)) return
+        saveExecutor.execute {
+            do {
+                val job = pendingSave.getAndSet(null) ?: break
+                storageManager.saveToFile(job.first, job.second)
+            } while (true)
+            saveRunning.set(false)
+            // 收尾竞态：置回标记的瞬间可能又有新任务进来，补一次入队
+            if (pendingSave.get() != null) enqueuePendingSave()
+        }
+    }
+
+    fun autoSave() {
+        if (_documentFile == null) return
+        saveHandler.removeCallbacks(saveTick)
+        saveHandler.postDelayed(saveTick, SAVE_DEBOUNCE_MS)
+    }
+
+    /**
+     * 退出图纸 / 手动保存：立刻落盘并等队列写完后返回。
+     * 退出路径上必须拿到已提交的文件，否则后台写还没开始就被切走。
+     * 2026-10-13：①取消防抖类延迟保存（滑块 900ms / 微调 700ms）——否则退出后任务在列表界面上
+     * 二次触发构建，造成"退出卡几秒"；②文档构建也放到保存线程（主线程此前在此做重活）。
+     */
+    fun saveNow() {
+        saveHandler.removeCallbacks(saveTick)
+        _sliderSaveJob?.cancel()
+        val f = _documentFile ?: return
+        // 2026-10-14：不再在主线程等待写盘（退出卡顿根治）。写盘为原子替换（.part+rename），
+        // 文件任一时刻都是完整版本；"切换文档/操作文件"前由 PendingWrites 等待本任务完成，
+        // 防止后台构建读到切换后的状态写错文件。
+        PendingWrites.track(saveExecutor.submit {
+            storageManager.saveToFile(f, buildDocument())
+        })
+    }
+
     fun getDocumentFile(): java.io.File? = _documentFile
 
     /** 加载已有文档 */
@@ -1932,11 +3333,17 @@ class DrawingViewModel(
         for (p in data.primitives) _primitives.add(p)
         _layers.clear(); for (l in data.layers) _layers.add(l)
         _blockDefs.clear(); for (b in data.blockDefs) _blockDefs.add(b)
+        _images.clear(); for (i in data.images) _images.add(i)
+        imageBitmaps.clear()
+        if (data.images.isNotEmpty()) decodeImageBitmapsAsync(data.images)
         // 同时从 blocks/ 文件夹加载所有块文件（去重：文件里的覆盖文档里的同名 ID）
         mergeBlockFiles()
         _canvasScale.value = doc.canvasScale; _canvasOffsetX.value = doc.canvasOffsetX; _canvasOffsetY.value = doc.canvasOffsetY
         _activeLayerId.value = doc.activeLayerId
         _documentName.value = doc.name; _documentFile = file
+        applyDocumentVariables(data)
+        resetPerDocumentState()
+        restoreUndoHistory(doc.undoHistory, doc.undoHistoryV2)  // 恢复随文件保存的撤销存档
     }
 
     /** 从已转换的 DocumentData 加载（用于后台线程预转换后主线程应用） */
@@ -1945,12 +3352,58 @@ class DrawingViewModel(
         for (p in data.primitives) _primitives.add(p)
         _layers.clear(); for (l in data.layers) _layers.add(l)
         _blockDefs.clear(); for (b in data.blockDefs) _blockDefs.add(b)
+        _images.clear(); for (i in data.images) _images.add(i)
+        imageBitmaps.clear()
+        if (data.images.isNotEmpty()) decodeImageBitmapsAsync(data.images)
         mergeBlockFiles()
         _canvasScale.value = data.canvasScale
         _canvasOffsetX.value = data.canvasOffsetX
         _canvasOffsetY.value = data.canvasOffsetY
         _activeLayerId.value = data.activeLayerId
         _documentName.value = file.nameWithoutExtension; _documentFile = file
+        applyDocumentVariables(data)
+        resetPerDocumentState()
+        restoreUndoHistory(data.undoHistory, data.undoHistoryV2)  // 恢复随文件保存的撤销存档
+    }
+
+    /**
+     * 应用图纸级变量（每张图纸独立，文件间不共享）。
+     * 旧版文件缺少这些字段时为 null，回退到默认值：
+     * 线性比例=1，线宽=5，数字=1，区间数字首数字=1、尾数字为空。
+     */
+    private fun applyDocumentVariables(data: DocumentData) {
+        // 方向预设与箭头跨距（原有文档级字段）
+        _numberLabel.value = _numberLabel.value.copy(horizontalOnly = data.numberHorizontal)
+        _numberLabel.value = _numberLabel.value.copy(circled = data.numberCircled)
+        _textHorizontalOnly.value = data.textHorizontal
+        _rangeLabel.value = _rangeLabel.value.copy(
+            horizontalOnly = data.rangeHorizontal,
+            reversed = data.rangeReversed,
+            numbersFaceLeft = data.rangeNumbersFaceLeft
+        )
+        docDefaultArrowSpan = data.defaultArrowSpan
+        _rangeLabel.value = _rangeLabel.value.copy(arrowSpan = data.defaultArrowSpan)
+        // 线宽、线性比例、数字、区间数字首/尾数字
+        _currentStrokeWidth.value = (data.strokeWidth ?: 5f).coerceIn(1f, 40f)
+        _globalLineScale.value = (data.globalLineScale ?: 1f).coerceIn(0.25f, 4f)
+        val numStart = data.numberStart ?: 1
+        _numberLabel.value = _numberLabel.value.copy(startFrom = numStart, currentValue = numStart)
+        _rangeLabel.value = _rangeLabel.value.copy(
+            startValue = data.rangeStart ?: 1,
+            endValue = data.rangeEnd ?: 2,
+            lastEndValue = data.rangeLastEnd ?: 1
+        )
+    }
+
+    /** 每个图纸文件独立的状态：撤销/重做历史、选择、变换残留（文件间不共享） */
+    private fun resetPerDocumentState() {
+        undoHistory.clear(); redoHistory.clear()
+        _canUndo.value = false; _canRedo.value = false
+        clearSelection()
+        _pendingEdit.value = PendingEdit()
+        _currentPrimitive.value = null
+        _imageManageActive.value = false
+        _imgSelectedId.value = null
     }
 
     private fun mergeBlockFiles() {
@@ -1973,20 +3426,72 @@ class DrawingViewModel(
             name = _documentName.value,
             canvasOffsetX = _canvasOffsetX.value,
             canvasOffsetY = _canvasOffsetY.value,
-            canvasScale = _canvasScale.value
+            canvasScale = _canvasScale.value,
+            numberHorizontal = _numberLabel.value.horizontalOnly,
+            numberCircled = _numberLabel.value.circled,
+            textHorizontal = _textHorizontalOnly.value,
+            rangeHorizontal = _rangeLabel.value.horizontalOnly,
+            rangeReversed = _rangeLabel.value.reversed,
+            rangeNumbersFaceLeft = _rangeLabel.value.numbersFaceLeft,
+            defaultArrowSpan = docDefaultArrowSpan,
+            strokeWidth = _currentStrokeWidth.value,
+            globalLineScale = _globalLineScale.value,
+            numberStart = _numberLabel.value.startFrom,
+            rangeStart = _rangeLabel.value.startValue,
+            rangeEnd = _rangeLabel.value.endValue,
+            rangeLastEnd = _rangeLabel.value.lastEndValue,
+            undoHistoryV2 = if (undoHistory.isEmpty()) null else packUndoHistory(),
+            images = _images.toList()
         )
     }
 
     fun exportDxf(context: Context, uri: Uri): Boolean {
         return try {
-            context.contentResolver.openOutputStream(uri)?.use { stream ->
-                DxfWriter(stream).write(_primitives.toList(), _layers.toList(), blockDefs = _blockDefs.toList())
-                hasUnsavedChanges = false; true
-            } ?: false
-        } catch (e: Exception) { e.printStackTrace(); false }
+            // 临时目录：DXF 与参考图片同目录生成（IMAGE 实体是相对文件名引用）
+            val tmpDir = File(context.cacheDir, "dxf_out_${System.currentTimeMillis()}").apply { mkdirs() }
+            val tmpFile = File(tmpDir, "${_documentName.value.ifBlank { "export" }}.dxf")
+            val res = DxfExporter.export(
+                context, tmpFile.absolutePath,
+                _primitives.toList(), _layers.toList(), _blockDefs.toList(), _images.toList()
+            )
+            if (!res.success) {
+                android.util.Log.e("DxfExport", "Export failed: ${DxfExporter.getLastError()}")
+                tmpDir.deleteRecursively()
+                return false
+            }
+            val out = context.contentResolver.openOutputStream(uri)
+            if (out == null) {
+                android.util.Log.e("DxfExport", "openOutputStream returned null for uri=$uri")
+                tmpDir.deleteRecursively()
+                return false
+            }
+            out.use { o ->
+                if (res.imageFiles.isEmpty()) {
+                    tmpFile.inputStream().use { ins -> ins.copyTo(o) }
+                } else {
+                    // 含参考图片：打包 ZIP（解压后 DXF 与图片须放同一目录）
+                    java.util.zip.ZipOutputStream(o.buffered()).use { zos ->
+                        zos.putNextEntry(java.util.zip.ZipEntry(tmpFile.name))
+                        tmpFile.inputStream().use { it.copyTo(zos) }
+                        zos.closeEntry()
+                        for (imgFile in res.imageFiles) {
+                            zos.putNextEntry(java.util.zip.ZipEntry(imgFile.name))
+                            imgFile.inputStream().use { it.copyTo(zos) }
+                            zos.closeEntry()
+                        }
+                    }
+                }
+            }
+            tmpDir.deleteRecursively()
+            true
+        } catch (e: Exception) {
+            android.util.Log.e("DxfExport", "Export failed", e)
+            false
+        }
     }
 
-    fun manualSave(context: Context) { autoSave() }
+    /** 手动保存（分享前等场景，必须拿到已落盘的文件，故同步等待） */
+    fun manualSave(context: Context) { saveNow() }
 
     // ═══════════════════════════════════════════════════════
     //  橡皮擦
@@ -2010,10 +3515,11 @@ class DrawingViewModel(
                 is DrawingPrimitive.CirclePrimitive -> eraseCircle(p, worldPoint, rSq, toRemove, toAdd)
                 is DrawingPrimitive.LinePrimitive -> eraseLine(p, worldPoint, rSq, toRemove, toAdd)
                 is DrawingPrimitive.NumberLabelPrimitive -> {
-                    if (textHitByEraser(p.x, p.y, p.value.toString(), p.fontSize, p.rotation, worldPoint, rSq)) toRemove.add(p)
+                    // 文字/数字大小不受线型比例影响，命中检测与渲染一致（strokeScale=1）
+                    if (textHitByEraser(p.x, p.y, p.value.toString(), p.fontSize, p.rotation, worldPoint, rSq, 1f)) toRemove.add(p)
                 }
                 is DrawingPrimitive.TextPrimitive -> {
-                    if (textHitByEraser(p.x, p.y, p.text, p.fontSize, p.rotation, worldPoint, rSq)) toRemove.add(p)
+                    if (textHitByEraser(p.x, p.y, p.text, p.fontSize, p.rotation, worldPoint, rSq, 1f)) toRemove.add(p)
                 }
                 is DrawingPrimitive.RangeLabelPrimitive -> eraseRangeLabel(p, worldPoint, rSq, toRemove)
                 is DrawingPrimitive.BlockRefPrimitive -> eraseBlockRef(p, worldPoint, rSq, toRemove)
@@ -2050,13 +3556,16 @@ class DrawingViewModel(
         val disc = b * b - 4f * a * c
         val eps = 1e-4f
         if (disc < -eps) return emptyList()
-        if (disc < eps) return emptyList() // 相切不切，避免重根导致状态翻转两次
-        val sqrtD = sqrt(disc)
+        val sqrtD = sqrt(maxOf(disc, 0f))
         val t1 = (-b - sqrtD) / (2f * a)
         val t2 = (-b + sqrtD) / (2f * a)
+        // 切点（t1==t2 或近切）两个都保留：splitFreehand 会翻转两次=净零变化。
+        // 若合并成一个，inside 只翻转一次，切点之后的部分会被误判为圆内而整段删除。
+        // 同理，[0,1] 之外的 t 绝不能宽容钳入区间：t<0 的交点在线段起点之前，
+        // 钳到 0 会多翻转一次 inside，导致整条线被误判为圆内而整根删除
         return buildList {
-            if (t1 >= -eps && t1 <= 1f + eps) add(t1.coerceIn(0f, 1f))
-            if (t2 >= -eps && t2 <= 1f + eps) add(t2.coerceIn(0f, 1f))
+            if (t1 >= 0f && t1 <= 1f) add(t1)
+            if (t2 >= 0f && t2 <= 1f) add(t2)
         }.sorted()
     }
 
@@ -2067,43 +3576,79 @@ class DrawingViewModel(
         val edgeCount = if (isClosed) n else n - 1
         val result = mutableListOf<List<Point2D>>()
         val current = mutableListOf<Point2D>()
-        var inside = distSq(points[0], center) <= rSq
-        if (!inside) current.add(points[0])
 
-        val epsSq = 0.01f
+        val epsSq = 4f
         fun addDistinct(pt: Point2D) {
             if (current.isEmpty() || distSq(current.last(), pt) > epsSq) current.add(pt)
         }
+        fun emit() {
+            if (current.size >= 2) result.add(current.toList())
+            current.clear()
+        }
 
+        if (distSq(points[0], center) > rSq) current.add(points[0])
+
+        // 每条边按交点切成子段，用子段中点是否在圆内决定保留/丢弃。
+        // 不能用 inside 翻转计数：圆边界恰好穿过折线顶点时，相邻两条边会各报一个
+        // 交点（前一条 t=1、后一条 t=0），inside 翻转两次净零变化，顶点之后的
+        // 所有点被误判为圆内，导致整段残留被吞掉
         for (i in 0 until edgeCount) {
             val a = points[i]
             val b = if (isClosed && i == edgeCount - 1) points[0] else points[i + 1]
             val ts = segmentCircleIntersectAll(a, b, center, rSq)
+            var tPrev = 0f
             for (t in ts) {
-                val ix = a.x + t * (b.x - a.x)
-                val iy = a.y + t * (b.y - a.y)
-                val ip = Point2D(ix, iy)
-                if (!inside) {
-                    addDistinct(ip)
-                    if (current.size >= 2) result.add(current.toList())
+                val tm = (tPrev + t) / 2f
+                val mx = a.x + tm * (b.x - a.x); val my = a.y + tm * (b.y - a.y)
+                if (distSq(Point2D(mx, my), center) > rSq) {
+                    // 圆外子段：当前没有进行中的保留段时，以子段起点（交点）作为段首
+                    if (current.isEmpty()) current.add(Point2D(a.x + tPrev * (b.x - a.x), a.y + tPrev * (b.y - a.y)))
+                    addDistinct(Point2D(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y)))
+                } else {
+                    emit()
                 }
-                inside = !inside
-                current.clear()
-                if (!inside) current.add(ip)
+                tPrev = t
             }
-            if (!inside) {
-                val target = if (isClosed && i == edgeCount - 1) points[0] else points[i + 1]
-                addDistinct(target)
+            // 末尾子段 [tPrev, 1]
+            val tm = (tPrev + 1f) / 2f
+            val mx = a.x + tm * (b.x - a.x); val my = a.y + tm * (b.y - a.y)
+            if (distSq(Point2D(mx, my), center) > rSq) {
+                if (current.isEmpty()) current.add(Point2D(a.x + tPrev * (b.x - a.x), a.y + tPrev * (b.y - a.y)))
+                addDistinct(b)
+            } else {
+                emit()
             }
         }
-        if (!inside && current.size >= 2) {
+        if (current.size >= 2) {
             // 闭合路径起点已经作为第一点，避免末尾重复
             if (isClosed && current.size > 2 && distSq(current.first(), current.last()) <= epsSq) {
                 current.removeAt(current.size - 1)
             }
             if (current.size >= 2) result.add(current.toList())
         }
-        return result
+        // Post-merge: remove near-duplicate consecutive points (within 1px)
+        val deduped = result.map { seg ->
+            if (seg.size <= 2) seg
+            else {
+                val out = mutableListOf(seg[0])
+                for (k in 1 until seg.size) {
+                    if (distSq(out.last(), seg[k]) > 1f) out.add(seg[k])
+                }
+                out
+            }
+        }
+        // Filter out degenerate segments (碎段渲染成圆头小点"圆啾啾")。
+        // 阈值随橡皮半径缩放：小于橡皮尺度的残余段基本都是切割副产品而非有意保留
+        val minSegLen = maxOf(8f, sqrt(rSq) * 0.3f)
+        return deduped.filter { seg ->
+            if (seg.size < 2) return@filter false
+            var totalLen = 0f
+            for (j in 1 until seg.size) {
+                val dx = seg[j].x - seg[j - 1].x; val dy = seg[j].y - seg[j - 1].y
+                totalLen += sqrt(dx * dx + dy * dy)
+            }
+            totalLen >= minSegLen
+        }
     }
 
     /** 通用几何形状擦除命中检测：点在圆内或任意边与圆相交 */
@@ -2120,10 +3665,12 @@ class DrawingViewModel(
     }
 
     /** 旋转文字包围盒与圆相交检测 */
-    private fun textHitByEraser(x: Float, y: Float, text: String, fontSize: Float, rotation: Float, center: Point2D, rSq: Float): Boolean {
+    private fun textHitByEraser(x: Float, y: Float, text: String, fontSize: Float, rotation: Float, center: Point2D, rSq: Float, strokeScale: Float = 1f): Boolean {
         if (text.isEmpty()) return distSq(Point2D(x, y), center) <= rSq
-        val halfW = text.length * fontSize * 0.35f
-        val halfH = fontSize * 0.5f
+        boundsMeasurePaint.textSize = fontSize * 1.3f * strokeScale
+        val halfW = boundsMeasurePaint.measureText(text) / 2f
+        val fm = boundsMeasurePaint.fontMetrics
+        val halfH = (fm.descent - fm.ascent) / 2f
         val cosR = cos(rotation); val sinR = sin(rotation)
         val corners = listOf(
             Point2D(-halfW, -halfH), Point2D(halfW, -halfH),
@@ -2144,9 +3691,20 @@ class DrawingViewModel(
             toRemove.add(p)
             if (_fineEraseEnabled.value) {
                 val segments = splitFreehand(p.points, center, rSq, isClosed = p.isClosed)
-                for (seg in segments) toAdd.add(p.copy(points = seg))
+                for (seg in segments) {
+                    if (seg.size >= 2) toAdd.add(p.copy(points = seg, isClosed = false,
+                        sharpCorners = remapSharpCorners(p.points, p.sharpCorners, seg)))
+                }
             }
         }
+    }
+
+    /** 切割后按点坐标重映射尖角索引：splitFreehand 会插入交点/裁掉点，旧索引指向的点已错位 */
+    private fun remapSharpCorners(oldPoints: List<Point2D>, oldSharp: Set<Int>, seg: List<Point2D>): Set<Int> {
+        if (oldSharp.isEmpty()) return emptySet()
+        val sharpPts = oldSharp.mapNotNullTo(HashSet<Point2D>()) { oldPoints.getOrNull(it) }
+        if (sharpPts.isEmpty()) return emptySet()
+        return seg.indices.filterTo(HashSet<Int>()) { seg[it] in sharpPts }
     }
 
     private fun eraseRect(p: DrawingPrimitive.RectanglePrimitive, center: Point2D, rSq: Float,
@@ -2156,8 +3714,24 @@ class DrawingViewModel(
             toRemove.add(p)
             if (_fineEraseEnabled.value) {
                 val segments = splitFreehand(pts, center, rSq, isClosed = true)
+                val xs = p.corners.map { it.x }; val ys = p.corners.map { it.y }
+                val w = xs.max() - xs.min(); val h = ys.max() - ys.min()
+                val segX = maxOf(4, minOf(200, (w / 20f + 0.5f).toInt()))
+                val segY = maxOf(4, minOf(200, (h / 20f + 0.5f).toInt()))
                 for (seg in segments) {
-                    toAdd.add(DrawingPrimitive.FreehandPath(points = seg, color = p.color, strokeWidth = p.strokeWidth, layerId = p.layerId, lineStyle = p.lineStyle))
+                    if (seg.size >= 2) {
+                        val cornerSet = mutableSetOf<Int>()
+                        for (k in seg.indices) {
+                            val pt = seg[k]
+                            if ((abs(pt.x - pts[0].x) < 0.01f && abs(pt.y - pts[0].y) < 0.01f) ||
+                                (abs(pt.x - pts[segX].x) < 0.01f && abs(pt.y - pts[segX].y) < 0.01f) ||
+                                (abs(pt.x - pts[segX + segY].x) < 0.01f && abs(pt.y - pts[segX + segY].y) < 0.01f) ||
+                                (abs(pt.x - pts[2 * segX + segY].x) < 0.01f && abs(pt.y - pts[2 * segX + segY].y) < 0.01f)) {
+                                cornerSet.add(k)
+                            }
+                        }
+                        toAdd.add(DrawingPrimitive.FreehandPath(points = seg, color = p.color, strokeWidth = p.strokeWidth, layerId = p.layerId, lineStyle = p.lineStyle, lineScaleFactor = p.lineScaleFactor, sharpCorners = cornerSet))
+                    }
                 }
             }
         }
@@ -2171,7 +3745,7 @@ class DrawingViewModel(
             if (_fineEraseEnabled.value) {
                 val segments = splitFreehand(pts, center, rSq, isClosed = true)
                 for (seg in segments) {
-                    toAdd.add(DrawingPrimitive.FreehandPath(points = seg, color = p.color, strokeWidth = p.strokeWidth, layerId = p.layerId, lineStyle = p.lineStyle))
+                    if (seg.size >= 2) toAdd.add(DrawingPrimitive.FreehandPath(points = seg, color = p.color, strokeWidth = p.strokeWidth, layerId = p.layerId, lineStyle = p.lineStyle, lineScaleFactor = p.lineScaleFactor))
                 }
             }
         }
@@ -2185,7 +3759,7 @@ class DrawingViewModel(
             if (_fineEraseEnabled.value) {
                 val segments = splitFreehand(pts, center, rSq, isClosed = false)
                 for (seg in segments) {
-                    toAdd.add(DrawingPrimitive.FreehandPath(points = seg, color = p.color, strokeWidth = p.strokeWidth, layerId = p.layerId, lineStyle = p.lineStyle))
+                    if (seg.size >= 2) toAdd.add(DrawingPrimitive.FreehandPath(points = seg, color = p.color, strokeWidth = p.strokeWidth, layerId = p.layerId, lineStyle = p.lineStyle, lineScaleFactor = p.lineScaleFactor))
                 }
             }
         }
@@ -2194,7 +3768,11 @@ class DrawingViewModel(
     private fun eraseRangeLabel(p: DrawingPrimitive.RangeLabelPrimitive, center: Point2D, rSq: Float,
                                 toRemove: MutableList<DrawingPrimitive>) {
         val arrowLen = maxOf(80f * p.arrowSpan, 20f)
-        val reach = arrowLen / 2f + p.fontSize * 2f
+        // 区间数字大小不受线型比例影响，命中检测与渲染一致
+        boundsMeasurePaint.textSize = p.fontSize * 1.3f
+        val textHalfW = maxOf(boundsMeasurePaint.measureText(p.startValue.toString()),
+            boundsMeasurePaint.measureText(p.endValue.toString())) / 2f
+        val reach = arrowLen / 2f + textHalfW + p.fontSize * 0.5f
         val cosR = cos(p.rotation); val sinR = sin(p.rotation)
         val hx = reach * cosR; val hy = reach * sinR
         val pts = listOf(Point2D(p.x - hx, p.y - hy), Point2D(p.x + hx, p.y + hy))
@@ -2205,80 +3783,115 @@ class DrawingViewModel(
                               toRemove: MutableList<DrawingPrimitive>) {
         val r = sqrt(rSq)
         val blockDef = _blockDefs.find { it.id == p.blockDefId }
-        val radius = if (blockDef?.bounds != null) {
-            val bw = blockDef.bounds.maxX - blockDef.bounds.minX
-            val bh = blockDef.bounds.maxY - blockDef.bounds.minY
-            maxOf(bw, bh) * 0.5f * p.scale
+        val bounds = blockDef?.bounds
+        if (bounds != null) {
+            val bw = (bounds.maxX - bounds.minX) * p.scale
+            val bh = (bounds.maxY - bounds.minY) * p.scale
+            val hx = bw / 2f; val hy = bh / 2f
+            // Transform eraser center into block's local coordinate system (account for rotation)
+            val cosR = cos(-p.rotation); val sinR = sin(-p.rotation)
+            val dx0 = center.x - p.x; val dy0 = center.y - p.y
+            val localX = dx0 * cosR - dy0 * sinR
+            val localY = dx0 * sinR + dy0 * cosR
+            // Point-to-AABB surface distance in local space
+            val dx = abs(localX) - hx
+            val dy = abs(localY) - hy
+            val dist = if (dx <= 0f && dy <= 0f) 0f
+            else if (dx > 0f && dy > 0f) sqrt(dx * dx + dy * dy)
+            else if (dx > 0f) dx else dy
+            if (dist <= r) toRemove.add(p)
+        } else if (blockDef != null) {
+            // Fallback: compute bounds from block primitives
+            val realBounds = computeBlockBounds(blockDef.primitives)
+            if (realBounds != null) {
+                val bw = (realBounds.maxX - realBounds.minX) * p.scale
+                val bh = (realBounds.maxY - realBounds.minY) * p.scale
+                val hx = bw / 2f; val hy = bh / 2f
+                val cosR = cos(-p.rotation); val sinR = sin(-p.rotation)
+                val dx0 = center.x - p.x; val dy0 = center.y - p.y
+                val localX = dx0 * cosR - dy0 * sinR
+                val localY = dx0 * sinR + dy0 * cosR
+                val dx = abs(localX) - hx
+                val dy = abs(localY) - hy
+                val dist = if (dx <= 0f && dy <= 0f) 0f
+                else if (dx > 0f && dy > 0f) sqrt(dx * dx + dy * dy)
+                else if (dx > 0f) dx else dy
+                if (dist <= r) toRemove.add(p)
+            } else {
+                if (distSq(Point2D(p.x, p.y), center) <= rSq) toRemove.add(p)
+            }
         } else {
-            50f * p.scale
+            if (distSq(Point2D(p.x, p.y), center) <= rSq) toRemove.add(p)
         }
-        val threshold = r + radius
-        if (distSq(Point2D(p.x, p.y), center) <= threshold * threshold) toRemove.add(p)
     }
 
     /** 包围盒快速排除：圆心到基元包围盒的最短距离如果大于半径则跳过 */
     private fun eraserHitBounds(p: DrawingPrimitive, center: Point2D, rSq: Float): Boolean {
-        val bounds: Bounds = when (p) {
-            is DrawingPrimitive.FreehandPath -> {
-                var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE
-                var maxX = -Float.MAX_VALUE; var maxY = -Float.MAX_VALUE
-                for (pt in p.points) {
-                    if (pt.x < minX) minX = pt.x; if (pt.y < minY) minY = pt.y
-                    if (pt.x > maxX) maxX = pt.x; if (pt.y > maxY) maxY = pt.y
-                }
-                Bounds(minX, minY, maxX, maxY)
-            }
-            is DrawingPrimitive.RectanglePrimitive -> {
-                Bounds(minOf(p.startX, p.endX), minOf(p.startY, p.endY),
-                       maxOf(p.startX, p.endX), maxOf(p.startY, p.endY))
-            }
-            is DrawingPrimitive.CirclePrimitive -> {
-                val rx = abs(p.endX - p.centerX); val ry = abs(p.endY - p.centerY)
-                Bounds(p.centerX - rx, p.centerY - ry, p.centerX + rx, p.centerY + ry)
-            }
-            is DrawingPrimitive.LinePrimitive -> {
-                Bounds(minOf(p.startX, p.endX), minOf(p.startY, p.endY),
-                       maxOf(p.startX, p.endX), maxOf(p.startY, p.endY))
-            }
-            else -> return true // 其他类型不做包围盒排除
+        val r = sqrt(rSq)
+        val b = p.computeBounds(boundsMeasurePaint) ?: return true
+        // Add padding for eraser detection (strokeWidth / 2f for most types)
+        val pad = when (p) {
+            is DrawingPrimitive.LinePrimitive -> p.strokeWidth / 2f + 10f
+            is DrawingPrimitive.FreehandPath -> p.strokeWidth / 2f
+            else -> p.strokeWidth / 2f
         }
-        val closestX = center.x.coerceIn(bounds.minX, bounds.maxX)
-        val closestY = center.y.coerceIn(bounds.minY, bounds.maxY)
+        val bounds = Bounds(b[0] - pad, b[1] - pad, b[2] + pad, b[3] + pad)
+        val closestX = center.x.coerceIn(bounds.minX - r, bounds.maxX + r)
+        val closestY = center.y.coerceIn(bounds.minY - r, bounds.maxY + r)
         return distSq(Point2D(closestX, closestY), center) <= rSq
     }
 
-    /** 矩形轮廓采样 — 每条边等距加密，至少 4 段/边，每 20px 一个点 */
+    /** 矩形轮廓采样 — 先旋转4角再在每条边上等距插点，保证旋转精度 */
     private fun rectToPoints(r: DrawingPrimitive.RectanglePrimitive): List<Point2D> {
-        val left = minOf(r.startX, r.endX); val top = minOf(r.startY, r.endY)
-        val right = maxOf(r.startX, r.endX); val bottom = maxOf(r.startY, r.endY)
-        val w = right - left; val h = bottom - top
-        if (w < 0.01f && h < 0.01f) return listOf(Point2D(left, top))
-        val segX = maxOf(4, (w / 20f + 0.5f).toInt())
-        val segY = maxOf(4, (h / 20f + 0.5f).toInt())
+        val c = r.corners
+        val xs = c.map { it.x }; val ys = c.map { it.y }
+        val w = xs.max() - xs.min(); val h = ys.max() - ys.min()
+        if (w < 0.01f && h < 0.01f) return listOf(c.first())
+        if (!w.isFinite() || !h.isFinite() || w > 1e8f || h > 1e8f) return emptyList()
+        val segX = maxOf(4, minOf(200, (w / 20f + 0.5f).toInt()))
+        val segY = maxOf(4, minOf(200, (h / 20f + 0.5f).toInt()))
         val pts = mutableListOf<Point2D>()
-        // 上边 left→right（不含右上角）
-        for (i in 0 until segX) pts.add(Point2D(left + w * i / segX, top))
-        // 右边 top→bottom（不含右下角）
-        for (i in 0 until segY) pts.add(Point2D(right, top + h * i / segY))
-        // 下边 right→left（不含左下角）
-        for (i in 0 until segX) pts.add(Point2D(right - w * i / segX, bottom))
-        // 左边 bottom→top（不含左上角，闭合边的最后连接由 isClosed 处理）
-        for (i in 0 until segY) pts.add(Point2D(left, bottom - h * i / segY))
-        if (kotlin.math.abs(r.rotation) < 0.001f) return pts
-        val cx = (left + right) / 2f; val cy = (top + bottom) / 2f
-        val cosR = kotlin.math.cos(r.rotation); val sinR = kotlin.math.sin(r.rotation)
-        return pts.map { pt ->
-            val dx = pt.x - cx; val dy = pt.y - cy
-            Point2D(cx + dx * cosR - dy * sinR, cy + dx * sinR + dy * cosR)
+        // 上边 c[0]→c[1]
+        for (i in 0 until segX) {
+            val t = i.toFloat() / segX
+            pts.add(Point2D(c[0].x + t * (c[1].x - c[0].x), c[0].y + t * (c[1].y - c[0].y)))
         }
+        // 右边 c[1]→c[2]
+        for (i in 0 until segY) {
+            val t = i.toFloat() / segY
+            pts.add(Point2D(c[1].x + t * (c[2].x - c[1].x), c[1].y + t * (c[2].y - c[1].y)))
+        }
+        // 下边 c[2]→c[3]
+        for (i in 0 until segX) {
+            val t = i.toFloat() / segX
+            pts.add(Point2D(c[2].x + t * (c[3].x - c[2].x), c[2].y + t * (c[3].y - c[2].y)))
+        }
+        // 左边 c[3]→c[0]
+        for (i in 0 until segY) {
+            val t = i.toFloat() / segY
+            pts.add(Point2D(c[3].x + t * (c[0].x - c[3].x), c[3].y + t * (c[0].y - c[3].y)))
+        }
+        // 应用矩形自身旋转（存储角点为轴对齐 AABB，旋转在 rotation 字段）：
+        // 不旋转的话，精细擦除旋转矩形后剩余线段的角度会丢失（变回水平/竖直）
+        if (abs(r.rotation) > 0.001f) {
+            val cx = (xs.min() + xs.max()) / 2f; val cy = (ys.min() + ys.max()) / 2f
+            val cosR = cos(r.rotation); val sinR = sin(r.rotation)
+            return pts.map { pt ->
+                val dx = pt.x - cx; val dy = pt.y - cy
+                Point2D(cx + dx * cosR - dy * sinR, cy + dx * sinR + dy * cosR)
+            }
+        }
+        return pts
     }
 
     /** 圆形轮廓采样（32 段，不重复首尾） */
     private fun circleToPoints(c: DrawingPrimitive.CirclePrimitive): List<Point2D> {
-        val rx = abs(c.endX - c.centerX); val ry = abs(c.endY - c.centerY)
+        val rx = c.radiusX; val ry = c.radiusY
+        val cosR = kotlin.math.cos(c.rotation); val sinR = kotlin.math.sin(c.rotation)
         return (0 until 32).map { i ->
             val angle = 2f * Math.PI.toFloat() * i / 32f
-            Point2D(c.centerX + rx * cos(angle), c.centerY + ry * sin(angle))
+            val lx = rx * cos(angle); val ly = ry * sin(angle)
+            Point2D(c.centerX + lx * cosR - ly * sinR, c.centerY + lx * sinR + ly * cosR)
         }
     }
 
@@ -2295,7 +3908,7 @@ class DrawingViewModel(
     fun saveSettings() {
         sessionPrefs.edit().apply {
             putString(KEY_TOOL, _currentTool.value.name)
-            putLong(KEY_COLOR, _currentColor.value.value.toLong())
+            putInt(KEY_COLOR, _currentColor.value.toArgb())
             putFloat(KEY_STROKE, _currentStrokeWidth.value)
             putString(KEY_LINE_TYPE, _currentLineStyle.value.type.name)
             putFloat(KEY_LINE_DASH, _currentLineStyle.value.dashLength)
@@ -2311,6 +3924,27 @@ class DrawingViewModel(
             putString(KEY_PENDING_TEXT, _pendingTextContent.value)
             putBoolean(KEY_CONSTRAINT, _constraintEnabled.value)
             putBoolean(KEY_SNAP, _snapEnabled.value)
+            putBoolean(KEY_TEXT_HORIZONTAL, _textHorizontalOnly.value)
+            putBoolean(KEY_NUM_HORIZONTAL, _numberLabel.value.horizontalOnly)
+            putBoolean(KEY_NUM_CIRCLED, _numberLabel.value.circled)
+            putFloat(KEY_RANGE_ARROW_SPAN, _rangeLabel.value.arrowSpan)
+            putFloat(KEY_RANGE_FS, _rangeLabel.value.fontSize)
+            putBoolean(KEY_RANGE_HORIZONTAL, _rangeLabel.value.horizontalOnly)
+            putBoolean(KEY_RANGE_REVERSED, _rangeLabel.value.reversed)
+            putBoolean(KEY_RANGE_NUMBERS_FACE_LEFT, _rangeLabel.value.numbersFaceLeft)
+            putBoolean(KEY_QUICK_ERASE, _quickEraseEnabled.value)
+            putBoolean(KEY_FINE_ERASE, _fineEraseEnabled.value)
+            putBoolean(KEY_RECT_SQUARE, _rectangleSquareMode.value)
+            putBoolean(KEY_CIRCLE_MODE, _circleCircleMode.value)
+            putBoolean(KEY_LINE_SNAP, _lineSnapMode.value)
+            putBoolean(KEY_LANDSCAPE, _isLandscape.value)
+            putBoolean(KEY_ORTHO, _orthoMode.value)
+            putInt(KEY_NARR_START, _numArrayLabel.value.startValue)
+            putInt(KEY_NARR_END, _numArrayLabel.value.endValue)
+            putFloat(KEY_NARR_FS, _numArrayLabel.value.fontSize)
+            putFloat(KEY_NARR_GAP, _numArrayLabel.value.gap)
+            putFloat(KEY_NARR_ROTATION, _numArrayLabel.value.rotationDeg)
+            putBoolean(KEY_NARR_CIRCLED, _numArrayLabel.value.circled)
             apply()
         }
     }
@@ -2318,8 +3952,8 @@ class DrawingViewModel(
     private fun restoreSettings() {
         val p = sessionPrefs ?: return
         _currentTool.value = try { ToolType.valueOf(p.getString(KEY_TOOL, ToolType.FREEHAND.name) ?: ToolType.FREEHAND.name) } catch (_: Exception) { ToolType.FREEHAND }
-        _currentColor.value = Color(p.getLong(KEY_COLOR, Color.Black.value.toLong()))
-        _currentStrokeWidth.value = p.getFloat(KEY_STROKE, 4f)
+        _currentColor.value = Color(p.getInt(KEY_COLOR, Color.Black.toArgb()))
+        _currentStrokeWidth.value = p.getFloat(KEY_STROKE, 5f)
         _currentLineStyle.value = LineStyle(
             type = try { LineType.valueOf(p.getString(KEY_LINE_TYPE, LineType.SOLID.name) ?: LineType.SOLID.name) } catch (_: Exception) { LineType.SOLID },
             dashLength = p.getFloat(KEY_LINE_DASH, 12f),
@@ -2337,93 +3971,27 @@ class DrawingViewModel(
         _pendingTextContent.value = p.getString(KEY_PENDING_TEXT, "") ?: ""
         _constraintEnabled.value = p.getBoolean(KEY_CONSTRAINT, false)
         _snapEnabled.value = p.getBoolean(KEY_SNAP, false)
-    }
-
-    /** 围栏选中：检查选择框是否实际碰到图形的线条，不只靠包围盒 */
-    private fun fenceHitsGeometry(p: DrawingPrimitive, fence: Bounds): Boolean {
-        // 线段与轴对齐矩形相交测试（端点或穿越）
-        fun segmentHitsRect(ax: Float, ay: Float, bx: Float, by: Float): Boolean {
-            // 端点在内
-            if (ax >= fence.minX && ax <= fence.maxX && ay >= fence.minY && ay <= fence.maxY) return true
-            if (bx >= fence.minX && bx <= fence.maxX && by >= fence.minY && by <= fence.maxY) return true
-            // 线段完全在一边之外
-            val minX = minOf(ax, bx); val maxX = maxOf(ax, bx)
-            val minY = minOf(ay, by); val maxY = maxOf(ay, by)
-            if (maxX < fence.minX || minX > fence.maxX || maxY < fence.minY || minY > fence.maxY) return false
-            // 与矩形 4 边相交检测
-            fun ccw(px: Float, py: Float, qx: Float, qy: Float, rx: Float, ry: Float): Int {
-                val cross = (qx - px) * (ry - py) - (qy - py) * (rx - px)
-                return if (cross > 0) 1 else if (cross < 0) -1 else 0
-            }
-            fun segSeg(p1x: Float, p1y: Float, p2x: Float, p2y: Float,
-                       q1x: Float, q1y: Float, q2x: Float, q2y: Float): Boolean {
-                val o1 = ccw(p1x, p1y, p2x, p2y, q1x, q1y)
-                val o2 = ccw(p1x, p1y, p2x, p2y, q2x, q2y)
-                val o3 = ccw(q1x, q1y, q2x, q2y, p1x, p1y)
-                val o4 = ccw(q1x, q1y, q2x, q2y, p2x, p2y)
-                return o1 != o2 && o3 != o4
-            }
-            val l = fence.minX; val r = fence.maxX; val t = fence.minY; val b = fence.maxY
-            return segSeg(ax, ay, bx, by, l, t, l, b) ||  // left
-                   segSeg(ax, ay, bx, by, r, t, r, b) ||  // right
-                   segSeg(ax, ay, bx, by, l, t, r, t) ||  // top
-                   segSeg(ax, ay, bx, by, l, b, r, b)     // bottom
-        }
-        return when (p) {
-            is DrawingPrimitive.FreehandPath -> {
-                val pts = p.points
-                for (i in 1 until pts.size) {
-                    if (segmentHitsRect(pts[i-1].x, pts[i-1].y, pts[i].x, pts[i].y)) return true
-                }
-                if (p.isClosed && pts.size > 2)
-                    segmentHitsRect(pts.last().x, pts.last().y, pts[0].x, pts[0].y)
-                else false
-            }
-            is DrawingPrimitive.RectanglePrimitive -> {
-                val left = minOf(p.startX, p.endX); val right = maxOf(p.startX, p.endX)
-                val top = minOf(p.startY, p.endY); val bottom = maxOf(p.startY, p.endY)
-                if (kotlin.math.abs(p.rotation) < 0.001f) {
-                    segmentHitsRect(left, top, right, top) ||
-                    segmentHitsRect(right, top, right, bottom) ||
-                    segmentHitsRect(right, bottom, left, bottom) ||
-                    segmentHitsRect(left, bottom, left, top)
-                } else {
-                    val cx = (left + right) / 2f; val cy = (top + bottom) / 2f
-                    val cosR = kotlin.math.cos(p.rotation); val sinR = kotlin.math.sin(p.rotation)
-                    fun rot(wx: Float, wy: Float): Pair<Float, Float> {
-                        val dx = wx - cx; val dy = wy - cy
-                        return cx + dx * cosR - dy * sinR to cy + dx * sinR + dy * cosR
-                    }
-                    val c0 = rot(left, top); val c1 = rot(right, top)
-                    val c2 = rot(right, bottom); val c3 = rot(left, bottom)
-                    segmentHitsRect(c0.first, c0.second, c1.first, c1.second) ||
-                    segmentHitsRect(c1.first, c1.second, c2.first, c2.second) ||
-                    segmentHitsRect(c2.first, c2.second, c3.first, c3.second) ||
-                    segmentHitsRect(c3.first, c3.second, c0.first, c0.second)
-                }
-            }
-            is DrawingPrimitive.CirclePrimitive -> {
-                val rx = abs(p.endX - p.centerX); val ry = abs(p.endY - p.centerY)
-                val segs = 16
-                var prevX = p.centerX + rx * kotlin.math.cos(0.0).toFloat()
-                var prevY = p.centerY + ry * kotlin.math.sin(0.0).toFloat()
-                for (i in 1..segs) {
-                    val a = (i.toFloat() / segs) * 2f * kotlin.math.PI.toFloat()
-                    val cx = p.centerX + rx * kotlin.math.cos(a.toDouble()).toFloat()
-                    val cy = p.centerY + ry * kotlin.math.sin(a.toDouble()).toFloat()
-                    if (segmentHitsRect(prevX, prevY, cx, cy)) return true
-                    prevX = cx; prevY = cy
-                }
-                false
-            }
-            is DrawingPrimitive.LinePrimitive -> {
-                segmentHitsRect(p.startX, p.startY, p.endX, p.endY)
-            }
-            // 文字/数字/区间/图块：有填充面积，保持用包围盒（已经过 bounding box 过滤）
-            is DrawingPrimitive.NumberLabelPrimitive -> true
-            is DrawingPrimitive.TextPrimitive -> true
-            is DrawingPrimitive.RangeLabelPrimitive -> true
-            is DrawingPrimitive.BlockRefPrimitive -> true
-        }
+        _textHorizontalOnly.value = p.getBoolean(KEY_TEXT_HORIZONTAL, false)
+        _numberLabel.value = _numberLabel.value.copy(horizontalOnly = p.getBoolean(KEY_NUM_HORIZONTAL, true))
+        _numberLabel.value = _numberLabel.value.copy(circled = p.getBoolean(KEY_NUM_CIRCLED, false))
+        _rangeLabel.value = _rangeLabel.value.copy(arrowSpan = p.getFloat(KEY_RANGE_ARROW_SPAN, 1f),
+            fontSize = p.getFloat(KEY_RANGE_FS, 30f),
+            horizontalOnly = p.getBoolean(KEY_RANGE_HORIZONTAL, true),
+            reversed = p.getBoolean(KEY_RANGE_REVERSED, false),
+            numbersFaceLeft = p.getBoolean(KEY_RANGE_NUMBERS_FACE_LEFT, false))
+        _quickEraseEnabled.value = p.getBoolean(KEY_QUICK_ERASE, true)
+        _fineEraseEnabled.value = p.getBoolean(KEY_FINE_ERASE, true)
+        _rectangleSquareMode.value = p.getBoolean(KEY_RECT_SQUARE, false)
+        _circleCircleMode.value = p.getBoolean(KEY_CIRCLE_MODE, false)
+        _lineSnapMode.value = p.getBoolean(KEY_LINE_SNAP, false)
+        _isLandscape.value = p.getBoolean(KEY_LANDSCAPE, false)
+        _orthoMode.value = p.getBoolean(KEY_ORTHO, false)
+        _numArrayLabel.value = NumArrayLabel(
+            startValue = p.getInt(KEY_NARR_START, 1),
+            endValue = p.getInt(KEY_NARR_END, 5),
+            fontSize = p.getFloat(KEY_NARR_FS, 30f),
+            gap = p.getFloat(KEY_NARR_GAP, 100f),
+            rotationDeg = p.getFloat(KEY_NARR_ROTATION, if (p.getBoolean(KEY_NARR_VERTICAL, false)) 90f else 0f),
+            circled = p.getBoolean(KEY_NARR_CIRCLED, false))
     }
 }

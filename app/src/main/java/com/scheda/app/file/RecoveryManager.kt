@@ -24,6 +24,8 @@ class RecoveryManager(
         val doc = serializer.toDocument(primitives, layers, blockDefs, activeLayerId, name)
         try {
             file.writeText(GsonBuilder().setPrettyPrinting().create().toJson(doc), Charsets.UTF_8)
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            android.util.Log.e("RecoveryManager", "Auto-save failed: ${e.message}", e)
+        }
     }
 }

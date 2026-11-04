@@ -3,18 +3,21 @@ package com.scheda.app.viewmodel
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.ViewModel
+import com.scheda.app.file.PendingWrites
+import com.scheda.app.file.RecycleBinManager
 import com.scheda.app.file.ShareUtil
 import com.scheda.app.file.SchedaSerializer
 import com.scheda.app.file.StorageManager
 import java.io.File
 
 /**
- * 首页 ViewModel — 文件夹导航 + 文件浏览与分享。统一走 java.io.File。
+ * 首页 ViewModel — 文件夹导航 + 文件浏览与分享 + 回收站。统一走 java.io.File。
  */
 class HomeViewModel(
     private val storageManager: StorageManager,
     private val shareUtil: ShareUtil,
-    private val serializer: SchedaSerializer
+    private val serializer: SchedaSerializer,
+    private val recycleBin: RecycleBinManager
 ) : ViewModel() {
 
     // ═══════════════════════════════════════════════════════
@@ -59,6 +62,18 @@ class HomeViewModel(
     val sel: List<File> get() = _sel
 
     // ═══════════════════════════════════════════════════════
+    //  回收站状态
+    // ═══════════════════════════════════════════════════════
+
+    private val _showRecycle = mutableStateOf(false)
+    val showRecycle: Boolean get() = _showRecycle.value
+
+    private val _recycleItems = mutableStateListOf<RecycleBinManager.RecycleItem>()
+    val recycleItems: List<RecycleBinManager.RecycleItem> get() = _recycleItems
+
+    val recycleCount: Int get() = _recycleItems.size
+
+    // ═══════════════════════════════════════════════════════
     //  导航
     // ═══════════════════════════════════════════════════════
 
@@ -78,6 +93,8 @@ class HomeViewModel(
         _items.clear()
         try {
             for (f in storageManager.listContents(dir)) {
+                // 隐藏回收站目录
+                if (f.isDirectory && f.name == ".scheda_recycle") continue
                 _items.add(Item(f,
                     name = f.name.removeSuffix(".scheda").ifBlank { f.name },
                     isDir = f.isDirectory,
@@ -114,25 +131,23 @@ class HomeViewModel(
     }
 
     // ═══════════════════════════════════════════════════════
-    //  操作
+    //  文件操作
     // ═══════════════════════════════════════════════════════
 
     fun newFolder(name: String): Boolean {
         if (name.isBlank()) return false
-        val ok = File(_curDir.value, name.trim()).mkdirs()
+        val dir = _curDir.value ?: return false
+        val ok = File(dir, name.trim()).mkdirs()
         if (ok) refresh()
         return ok
     }
 
+    /** 删除 → 移入回收站 */
     fun delete(item: Item): Boolean {
-        try {
-            if (item.file.deleteRecursively()) {
-                _sel.remove(item.file)
-                refresh()
-                return true
-            }
-        } catch (_: Exception) {}
-        return false
+        PendingWrites.awaitBlocking()   // 后台写盘未完成时稍等，避免与回收站移动竞争（2026-10-14）
+        return recycleBin.moveToRecycle(item.file).also {
+            if (it) { _sel.remove(item.file); refresh() }
+        }
     }
 
     // ═══════════════════════════════════════════════════════
@@ -145,8 +160,10 @@ class HomeViewModel(
     fun isSel(item: Item) = _sel.contains(item.file)
     fun clearSel() { _sel.clear() }
 
+    /** 选中批量删除 → 移入回收站 */
     fun deleteSel() {
-        for (f in _sel.toList()) { f.deleteRecursively() }
+        PendingWrites.awaitBlocking()   // 同上（2026-10-14）
+        for (f in _sel.toList()) { recycleBin.moveToRecycle(f) }
         _sel.clear()
         refresh()
     }
@@ -163,6 +180,7 @@ class HomeViewModel(
 
     /** 将选中的文件/文件夹移动到目标目录 */
     fun moveItems(targetDir: File): Boolean {
+        PendingWrites.awaitBlocking()   // 同上（2026-10-14）
         val fl = _sel.toList()
         if (fl.isEmpty()) return false
         try {
@@ -189,4 +207,47 @@ class HomeViewModel(
 
     /** 根目录 */
     fun getRoot(): File? = storageManager.getRoot()
+
+    // ═══════════════════════════════════════════════════════
+    //  回收站操作
+    // ═══════════════════════════════════════════════════════
+
+    /** 打开回收站 */
+    fun openRecycleBin() {
+        _recycleItems.clear()
+        _recycleItems.addAll(recycleBin.getItems())
+        _showRecycle.value = true
+    }
+
+    /** 关闭回收站 */
+    fun closeRecycleBin() {
+        _showRecycle.value = false
+        _recycleItems.clear()
+        refresh()
+    }
+
+    /** 从回收站还原 */
+    fun restoreFromRecycle(item: RecycleBinManager.RecycleItem): Boolean {
+        return recycleBin.restore(item).also {
+            if (it) {
+                _recycleItems.remove(item)
+                // 如果回到回收站视图后刷新
+                if (_recycleItems.isEmpty()) _showRecycle.value = false
+            }
+        }
+    }
+
+    /** 从回收站永久删除 */
+    fun deleteFromRecycle(item: RecycleBinManager.RecycleItem): Boolean {
+        return recycleBin.deletePermanently(item).also {
+            if (it) _recycleItems.remove(item)
+        }
+    }
+
+    /** 清空回收站 */
+    fun emptyRecycleBin() {
+        recycleBin.emptyBin()
+        _recycleItems.clear()
+        _showRecycle.value = false
+    }
 }

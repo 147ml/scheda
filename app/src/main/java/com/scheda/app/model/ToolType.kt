@@ -11,7 +11,8 @@ enum class ToolType(val displayName: String) {
     SELECT("选择"),
     ERASER("橡皮擦"),
     TEXT("文字"),
-    RANGE("区间数字");
+    RANGE("区间数字"),
+    NUM_ARRAY("数字阵列");
 }
 
 /** 当前选择的子模式 */
@@ -25,15 +26,15 @@ enum class SubTool {
 
 /** 选择框方向 */
 enum class SelectDirection {
-    /** 从左→右 / 上→下：框碰到就算选中 */
-    INSIDE_TOUCH,
-    /** 从右→左 / 下→上：框必须完全覆盖才选中 */
-    FULLY_COVER
+    /** 从左→右 / 上→下：框必须完全覆盖才选中 */
+    FULLY_COVER,
+    /** 从右→左 / 下→上：框碰到就算选中 */
+    INSIDE_TOUCH
 }
 
 /** 选中后操作 */
 enum class SelectionAction {
-    MOVE, ROTATE, SCALE, MIRROR, COPY, DELETE, CUT, PASTE, PROPERTIES, NONE
+    MOVE, ROTATE, SCALE, MIRROR, COPY, DELETE, CUT, PASTE, PROPERTIES, ARRAY, NONE
 }
 
 /** 编辑手柄位置 */

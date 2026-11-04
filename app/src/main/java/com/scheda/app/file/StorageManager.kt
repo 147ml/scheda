@@ -11,6 +11,8 @@ import com.google.gson.GsonBuilder
 import com.scheda.app.model.SchedaDocument
 import com.scheda.app.model.SerializableBlockDef
 import java.io.File
+import java.io.FileOutputStream
+import java.io.OutputStreamWriter
 
 /**
  * 文件系统管理 — MANAGE_EXTERNAL_STORAGE + java.io.File 单一后端。
@@ -18,15 +20,21 @@ import java.io.File
  * SAF 仅用于首次选目录（OpenDocumentTree），之后一切读写走 File API。
  * HyperOS 砍了 takePersistUriPermission，SAF 持久化不可用，所以不依赖它。
  */
-class StorageManager(val context: Context) {
+class StorageManager(context: Context) {
+    val context: Context = context.applicationContext
 
     companion object {
         private const val PREFS_NAME = "scheda_storage"
         private const val KEY_ROOT_PATH = "root_path"
         private const val TAG = "StorageManager"
+
+        /** 保存中间态后缀：写入用临时文件，成功后才原子替换目标文件 */
+        const val PART_SUFFIX = ".part"
     }
 
-    private val gson: Gson = GsonBuilder().setPrettyPrinting().create()
+    // 2026-10-14：改紧凑 JSON——原 setPrettyPrinting 使文件体积约 ×2.3、序列化/写盘耗时大幅增加；
+    // 读取端 Gson 兼容任意格式，不影响既有文件。
+    private val gson: Gson = GsonBuilder().create()
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     // ═══════════════════════════════════════════════════════
@@ -43,7 +51,7 @@ class StorageManager(val context: Context) {
 
     /** App 是否可以正常读写文件 */
     val isAccessible: Boolean
-        get() = hasFullAccess && rootPath != null && File(rootPath!!).run { exists() || mkdirs() }
+        get() = hasFullAccess && rootPath != null && File(rootPath!!).exists()
 
     /** 是否已完成首次设置 */
     val isInitialized: Boolean
@@ -60,7 +68,7 @@ class StorageManager(val context: Context) {
     fun setRootFromTreeUri(uri: Uri) {
         val path = treeUriToPath(uri)
         if (path != null) {
-            prefs.edit().putString(KEY_ROOT_PATH, path).commit()
+            prefs.edit().putString(KEY_ROOT_PATH, path).apply()
             File(path).mkdirs()
             android.util.Log.i(TAG, "根目录已设置: $path")
         } else {
@@ -86,10 +94,11 @@ class StorageManager(val context: Context) {
             try {
                 val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
                 context.startActivity(intent)
-            } catch (e: Exception) {
-                // fallback: try generic manage settings
-                val intent = Intent(Settings.ACTION_MANAGE_APPLICATIONS_SETTINGS)
-                context.startActivity(intent)
+            } catch (_: Exception) {
+                try {
+                    val intent = Intent(Settings.ACTION_MANAGE_APPLICATIONS_SETTINGS)
+                    context.startActivity(intent)
+                } catch (_: Exception) { /* no settings available */ }
             }
         }
     }
@@ -100,11 +109,12 @@ class StorageManager(val context: Context) {
 
     fun getRoot(): File? = rootPath?.let { File(it) }
 
-    /** 列出指定目录的直接子内容（文件 + 文件夹，不递归）。目录优先排序。隐藏 blocks/ 目录。 */
+    /** 列出指定目录的直接子内容（文件 + 文件夹，不递归）。目录优先排序。隐藏 blocks/ 目录与保存中间态文件。 */
     fun listContents(dir: File): List<File> {
         val files = dir.listFiles() ?: return emptyList()
         return files
             .filter { !(it.isDirectory && it.name == "blocks") }
+            .filter { it.isDirectory || !it.name.endsWith(PART_SUFFIX) }
             .sortedWith(compareByDescending<File> { it.isDirectory }.thenBy { it.name })
     }
 
@@ -158,14 +168,34 @@ class StorageManager(val context: Context) {
         return saveToFile(file, doc)
     }
 
-    /** 保存到指定文件 */
+    /**
+     * 保存到指定文件。
+     *
+     * 流式写入：直接 JsonWriter → OutputStreamWriter → FileOutputStream，
+     * 不再先构造整串 JSON 再转 UTF-8 字节数组——多参考图图纸的文档可达数十 MB，
+     * 那两步会在堆上再复制 2~3 份，是"图片一多就崩"的直接原因。
+     *
+     * 因为改成了流式（边序列化边落盘），必须写临时文件再原子替换：
+     * 序列化中途失败（含 OOM）只留下一个临时文件，原图纸完好无损。
+     */
     fun saveToFile(file: File, doc: SchedaDocument): Boolean {
+        val target = file.absoluteFile
+        val tmp = File(target.parentFile, target.name + PART_SUFFIX)
         return try {
-            file.parentFile?.mkdirs()
-            file.writeText(gson.toJson(doc), Charsets.UTF_8)
+            target.parentFile?.mkdirs()
+            OutputStreamWriter(FileOutputStream(tmp), Charsets.UTF_8).use { w ->
+                gson.toJson(doc, w)
+            }
+            if (!tmp.renameTo(target)) {
+                // 个别文件系统 rename 不覆盖已存在文件 → 退化为复制后删除
+                tmp.copyTo(target, overwrite = true)
+                tmp.delete()
+            }
             true
-        } catch (e: Exception) {
-            android.util.Log.e(TAG, "保存文件失败: ${e.message}")
+        } catch (t: Throwable) {
+            // 含 OutOfMemoryError：写入中途失败绝不能把原图纸截断
+            android.util.Log.e(TAG, "保存文件失败: ${t.message}")
+            tmp.delete()
             false
         }
     }

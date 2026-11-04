@@ -11,6 +11,7 @@ data class NumberLabel(
     val currentValue: Int = 1,
     val fontSize: Float = 30f,
     val horizontalOnly: Boolean = true,
+    val circled: Boolean = false,
     /** 已放置但尚未固定的半成品 */
     val pending: NumberLabelInstance? = null
 )
@@ -31,5 +32,19 @@ data class RangeLabel(
     /** 上次确认的尾数字，下一个首数字自动=lastEndValue+1 */
     val lastEndValue: Int = 1,
     val horizontalOnly: Boolean = true,
-    val reversed: Boolean = false
+    val reversed: Boolean = false,
+    val numbersFaceLeft: Boolean = false,
+    val arrowSpan: Float = 1f
+)
+
+/** 数字阵列状态：点屏生成 startValue..endValue 一串普通数字 */
+data class NumArrayLabel(
+    val startValue: Int = 1,
+    val endValue: Int = 5,
+    val fontSize: Float = 30f,
+    /** 相邻数字中心距（世界坐标） */
+    val gap: Float = 100f,
+    /** 排列角度（度，0=横向向右，正角=顺时针），任意角度 */
+    val rotationDeg: Float = 0f,
+    val circled: Boolean = false
 )
