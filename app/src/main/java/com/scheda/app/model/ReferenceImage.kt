@@ -48,3 +48,33 @@ fun ReferenceImage.stripDataForUndoPool(
     if (id !in liveImageIds) dataSink[id] = data
     return copy(data = "")
 }
+
+/**
+ * 修复 Gson 反序列化留下的缺省字段。
+ *
+ * Gson 不走构造函数，旧文件里没有的字段会留在 null / false，而不是 Kotlin 的默认值：
+ * name、visible 是 2026-11-04 新增，此前的图纸两者都不存在 → name = null、visible = false。
+ * 直接用 copy() 重建会撞上构造函数对 name 的非空检查（release 里该检查被 R8 压成
+ * Object.getClass() 的空调用），所以这里用主构造函数显式重建。
+ *
+ * `name == null` 即判为旧格式：新格式写盘时 name 至少是空串，不会是 null。
+ */
+@Suppress("SENSELESS_COMPARISON", "USELESS_ELVIS")
+fun ReferenceImage.normalized(): ReferenceImage {
+    val legacy = name == null
+    return ReferenceImage(
+        id = id ?: "",
+        data = data ?: "",
+        centerX = centerX,
+        centerY = centerY,
+        width = width,
+        height = height,
+        rotationDeg = rotationDeg,
+        alpha = alpha,
+        layerId = layerId,
+        name = name ?: "",
+        visible = if (legacy) true else visible,
+        pixelWidth = pixelWidth,
+        pixelHeight = pixelHeight
+    )
+}

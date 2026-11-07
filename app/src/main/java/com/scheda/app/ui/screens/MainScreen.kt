@@ -125,6 +125,7 @@ import com.scheda.app.ui.components.HomeViewModelFactory
 import com.scheda.app.ui.components.LayerDialog
 import com.scheda.app.ui.components.ArrayDialog
 import androidx.compose.ui.graphics.Brush
+import com.scheda.app.diagnostics.CrashRecorder
 import com.scheda.app.ui.components.GlassMenuLayer
 import com.scheda.app.ui.components.SchedaDropdownMenu
 import com.scheda.app.ui.home.HomeScreen
@@ -138,7 +139,7 @@ import androidx.compose.foundation.lazy.items
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun MainScreen() {
-    // 启动时读取系统记录的上次退出原因，异常退出才弹诊断窗。
+    // 启动时读取系统记录的上次退出原因，有异常记录则弹窗提示
     ExitDiagnostics()
     val ctx = LocalContext.current
     val sm = remember { StorageManager(ctx) }
@@ -261,6 +262,7 @@ fun MainScreen() {
             HomeScreen(
                 vm = hvm,
                 onOpen = { f, name ->
+                    CrashRecorder.note("打开图纸 $name")
                     curFile = f
                     curName = name
                     screen = "drawing"

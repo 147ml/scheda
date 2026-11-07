@@ -78,6 +78,13 @@ class SchedaSerializer(private val context: Context) {
     }
 
     fun fromDocument(doc: SchedaDocument): DocumentData {
+        // 旧图纸的参考图没有 11-04 新增的 name/visible 字段：Gson 不走构造函数，
+        // 缺字段读出来是 null / false（Kotlin 默认值不生效），这里统一补正。
+        val images = doc.images?.map { it.normalized() } ?: emptyList()
+        @Suppress("UNCHECKED_CAST")
+        val undoHistoryV2 = doc.undoHistoryV2?.let { h ->
+            h.copy(imagePool = (h.imagePool as List<ReferenceImage?>).mapNotNull { it?.normalized() })
+        }
         return DocumentData(
             primitives = doc.primitives.mapNotNull { it.toPrimitive() },
             layers = doc.layers.map { it.toLayer() },
@@ -100,8 +107,8 @@ class SchedaSerializer(private val context: Context) {
             rangeEnd = doc.rangeEnd,
             rangeLastEnd = doc.rangeLastEnd,
             undoHistory = doc.undoHistory,
-            undoHistoryV2 = doc.undoHistoryV2,
-            images = doc.images ?: emptyList()
+            undoHistoryV2 = undoHistoryV2,
+            images = images
         )
     }
 

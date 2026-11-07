@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020 The Android Open Source Project
+ * Copyright 2022 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,17 +12,15 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- */
-
-/*
- * Scheda 下拉菜单 — 同窗浮层真玻璃版。
  *
+ * Modified from androidx.compose.material3.DropdownMenuContent /
+ * DropdownMenuPositionProvider to remove forced 8dp vertical padding.
+ *
+ * Scheda 下拉菜单 — 同窗浮层真玻璃版：
  * Popup / Dialog 是独立 Window，采不到页面内 LayerBackdrop（玻璃永远是空的），
  * 因此菜单不再走 Popup：锚点在自己的 Box 里捕获窗口坐标，菜单内容注册进全局
  * GlassMenuHost 单槽，由页面根 Box 末尾的 GlassMenuLayer 统一绘制为真玻璃卡片。
- *
- * 定位候选与 transformOrigin 算法沿用 Material3 DropdownMenuContent /
- * DropdownMenuPositionProvider 的逻辑（Apache 2.0, The Android Open Source Project）。
+ * 定位候选与 transformOrigin 算法沿用 Material3 的对应实现。
  */
 package com.scheda.app.ui.components
 

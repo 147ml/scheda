@@ -26,6 +26,12 @@
         </activity>
 
         <provider
+            android:name=".diagnostics.CrashInitProvider"
+            android:authorities="${applicationId}.crash-init"
+            android:exported="false"
+            android:initOrder="100" />
+
+        <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
             android:exported="false"

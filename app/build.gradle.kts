@@ -12,11 +12,12 @@ android {
         applicationId = "com.scheda.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 28
-        versionName = "3.5.0"
+        versionCode = 30
+        versionName = "3.5.2"
 
         ndk {
-            // 默认只构建 arm64-v8a；需要在 x86_64 模拟器上调试时加：-PSCHEDA_X86=true
+            // 发布包只带 arm64-v8a（x86_64 仅供模拟器调试）。
+            // 需要在 x86_64 模拟器上调试时加：-PSCHEDA_X86=true
             abiFilters += if (providers.gradleProperty("SCHEDA_X86").orNull == "true")
                 listOf("arm64-v8a", "x86_64") else listOf("arm64-v8a")
         }
@@ -33,7 +34,8 @@ android {
         }
     }
 
-    // 开源版适配：keystore 不入库，缺失时退回默认 debug 签名，保证 clone 后可直接构建
+    // 签名密钥不入库：有 release.keystore 就用正式签名，没有则退回 debug 签名，
+    // 保证任何人 clone 下来都能直接编译（正式密钥只在本机/CI 私密环境提供）。
     val releaseKeystore = rootProject.file("release.keystore")
     signingConfigs {
         if (releaseKeystore.exists()) {

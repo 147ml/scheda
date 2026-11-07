@@ -365,7 +365,7 @@ fun PaddedFrameOverlay(
     }
 }
 
-/** 手柄玻璃视觉：功能色掺色毛玻璃，无高光/描边/投影（用户定稿 A2）。backdrop=null 回退实色。 */
+/** 手柄玻璃视觉：功能色掺色毛玻璃，无高光/描边/投影。backdrop=null 回退实色。 */
 @Composable
 internal fun Modifier.glassHandle(backdrop: Backdrop?, shape: Shape, tint: Color): Modifier =
     if (backdrop != null) this.drawBackdrop(

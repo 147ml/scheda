@@ -33,18 +33,15 @@
 
 APK 输出位置：`app/build/outputs/apk/release/`
 
-### 签名配置
+### Keystore 配置
 
-仓库不包含 keystore。项目里没有 `release.keystore` 时，release 构建会自动退回 debug 签名，可直接编译安装；需要用自有证书签名时，把 keystore 放到项目根目录（默认文件名 `release.keystore`），再通过环境变量或 Gradle 属性传入密码：
+签名密码通过环境变量传入（可选，不设置则用默认值）：
 
 ```bash
 export SCHEDA_STORE_PASSWORD="你的密码"
 export SCHEDA_KEY_PASSWORD="你的密码"
-export SCHEDA_KEY_ALIAS="你的密钥别名"   # 可选，默认 147ml
 ./gradlew assembleRelease
 ```
-
-也可以用 `-PSCHEDA_STORE_PASSWORD=... -PSCHEDA_KEY_PASSWORD=...` 以 Gradle 属性方式传入（优先级高于环境变量）。
 
 ## 许可证
 

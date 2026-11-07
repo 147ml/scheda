@@ -576,8 +576,10 @@ class DrawingViewModel(
         val blockDefPool = h.blockDefPool.map { serializer.serializableToBlockDef(it) }
         // 池条目不携带位图数据（增量格式）：按 id 从 imageData（已删除的图）或文档 images（现存图）回填
         val liveImageData = _images.associate { it.id to it.data }
-        val imagePool: List<ReferenceImage> = h.imagePool.map { img ->
-            if (img.data.isNotEmpty()) img // 旧版格式：条目自带数据
+        @Suppress("UNCHECKED_CAST")
+        val imagePool: List<ReferenceImage> = (h.imagePool as List<ReferenceImage?>).mapNotNull { img ->
+            if (img == null) null // Gson 不校验泛型：JSON 数组里的 null 条目直接跳过
+            else if (img.data.isNotEmpty()) img // 旧版格式：条目自带数据
             else img.copy(data = h.imageData?.get(img.id) ?: liveImageData[img.id] ?: "")
         }
         return h.snapshots.map { s ->

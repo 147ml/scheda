@@ -85,7 +85,7 @@ object DxfExporter {
             lastError = "Step 3a: write images..."
             // 参考图片：base64 → 与 DXF 同目录的图片文件（IMAGEDEF 相对文件名引用），
             // 摆放参数随 JSON 传给 Python。图层隐藏的图片照常导出（图层在 DXF 中置 OFF，与基元一致）；
-            // 单张图片 visible=false 的直接跳过（用户 2026-11-04 定：隐藏的不带）。
+            // 单张图片 visible=false 的直接跳过（隐藏的图片不导出）。
             val imageFiles = ArrayList<File>()
             val imageMaps = ArrayList<Map<String, Any>>()
             val outDir = File(outputPath).parentFile
