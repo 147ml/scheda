@@ -12,8 +12,8 @@ android {
         applicationId = "com.scheda.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 30
-        versionName = "3.5.2"
+        versionCode = 33
+        versionName = "3.5.5"
 
         ndk {
             // 发布包只带 arm64-v8a（x86_64 仅供模拟器调试）。

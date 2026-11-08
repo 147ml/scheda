@@ -49,6 +49,7 @@ import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.input.pointer.pointerInput
+import com.scheda.app.ui.components.glassHighlight
 import com.scheda.app.ui.components.GlassOverlayEffect
 import com.scheda.app.ui.components.glassSurface
 import com.scheda.app.ui.components.glassAdapt
@@ -139,7 +140,7 @@ import androidx.compose.foundation.lazy.items
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun MainScreen() {
-    // 启动时读取系统记录的上次退出原因，有异常记录则弹窗提示
+    // 退出诊断：启动时读取系统记录的上次退出原因并弹窗
     ExitDiagnostics()
     val ctx = LocalContext.current
     val sm = remember { StorageManager(ctx) }
@@ -1581,6 +1582,7 @@ private fun BoxScope.FloatingStatusBar(
                         blur(2f.dp.toPx())
                         lens(12f.dp.toPx(), 24f.dp.toPx())
                     },
+                    highlight = { glassHighlight() },
                     onDrawSurface = { drawRect(Color(0x0AFFFFFF)) }
                 ) else Modifier
                     .background(Color(0xFF2A2A2A), RoundedCornerShape(16.dp))

@@ -36,7 +36,7 @@ object DxfExporter {
      * 导出结果。
      * imageFiles：随 DXF 生成的参考图片文件（与 DXF 同目录）。
      * DXF 的 IMAGE 实体是外部文件引用（IMAGEDEF 存相对文件名），
-     * 交付时图片必须与 DXF 放同一目录（打包 ZIP 或一并分享）。
+     * 导出后图片需与 DXF 放在同一目录（打包 ZIP 或一并分享）。
      */
     data class Result(val success: Boolean, val imageFiles: List<File> = emptyList())
 

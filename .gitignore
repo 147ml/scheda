@@ -24,6 +24,8 @@ local.properties
 release.keystore
 *.keystore
 *.jks
+*.p12
+*.pfx
 
 # Gradle wrapper
 gradle/wrapper/gradle-wrapper.jar.bak

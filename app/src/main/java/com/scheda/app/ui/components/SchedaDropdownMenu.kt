@@ -122,16 +122,29 @@ fun GlassMenuLayer(backdrop: Backdrop?, modifier: Modifier = Modifier) {
 
     var menuSize by remember { mutableStateOf(IntSize.Zero) }
     var layerSize by remember { mutableStateOf(IntSize.Zero) }
+    var layerOrigin by remember { mutableStateOf(IntOffset.Zero) }
     var measuredOwner by remember { mutableStateOf<Any?>(null) }
-    val anchor = spec.anchor.value
+    val anchorWin = spec.anchor.value
     val density = LocalDensity.current
 
     Box(
         modifier
             .fillMaxSize()
-            .onGloballyPositioned { layerSize = it.size }
+            .onGloballyPositioned {
+                layerSize = it.size
+                // 记录浮层自身在窗口里的原点：锚点是窗口坐标，两者必须换算到同一坐标系再算位置
+                val b = it.boundsInWindow()
+                layerOrigin = IntOffset(b.left.roundToInt(), b.top.roundToInt())
+            }
             .pointerInput(Unit) { detectTapGestures { current?.onDismissRequest?.invoke() } }
     ) {
+        // 窗口坐标 → 本层坐标（浮层原点不在窗口 (0,0) 时，直接用窗口坐标会整体偏移）
+        val anchor = IntRect(
+            anchorWin.left - layerOrigin.x,
+            anchorWin.top - layerOrigin.y,
+            anchorWin.right - layerOrigin.x,
+            anchorWin.bottom - layerOrigin.y
+        )
         val offset = with(density) { computeMenuOffset(anchor, menuSize, layerSize, this) }
         val menuRect = IntRect(offset.x, offset.y, offset.x + menuSize.width, offset.y + menuSize.height)
         val origin = calcTransformOrigin(anchor, menuRect)
@@ -245,15 +258,17 @@ private fun computeMenuOffset(
         return IntOffset(anchor.left, anchor.bottom)
     }
     val hMargin = with(density) { 8.dp.roundToPx() }
-    val vMargin = with(density) { 48.dp.roundToPx() }
+    // 垂直安全边距：原 48dp（Material3 给状态栏的余量）对浮动菜单太大，底部按钮会把候选全挤掉
+    val vMargin = with(density) { 8.dp.roundToPx() }
     val xCandidates = listOf(
         anchor.left,                       // 锚点左对齐
         anchor.right - menu.width,          // 锚点右对齐
         if (anchor.center.x < layer.width / 2) 0 else layer.width - menu.width, // 贴边兜底
     )
+    val gap = with(density) { 6.dp.roundToPx() }
     val yCandidates = listOf(
-        anchor.bottom,                     // 锚点下方
-        anchor.top - menu.height,          // 上翻
+        anchor.bottom + gap,               // 锚点下方（留 6dp 空隙）
+        anchor.top - menu.height - gap,    // 上翻（留 6dp 空隙，避免贴着按钮）
         anchor.top - menu.height / 2,      // 与锚点垂直居中
         if (anchor.center.y < layer.height / 2) 0 else layer.height - menu.height,
     )

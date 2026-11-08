@@ -55,6 +55,7 @@ import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.lens
 import com.kyant.backdrop.effects.vibrancy
+import com.scheda.app.ui.components.glassHighlight
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
@@ -412,6 +413,7 @@ fun PostCreationOverlay(
                             blur(2f.dp.toPx())
                             lens(12f.dp.toPx(), 24f.dp.toPx())
                         },
+                        highlight = { glassHighlight() },
                         onDrawSurface = { drawRect(Color(0x0AFFFFFF)) }
                     )
                 } else Modifier.size(btnSize).clip(CircleShape).background(Color(0xFF757575))
@@ -429,6 +431,7 @@ fun PostCreationOverlay(
                             blur(2f.dp.toPx())
                             lens(12f.dp.toPx(), 24f.dp.toPx())
                         },
+                        highlight = { glassHighlight() },
                         onDrawSurface = { drawRect(Color(0x0AFFFFFF)) }
                     )
                 } else Modifier.size(btnSize).clip(CircleShape).background(Color(0xFF4CAF50))

@@ -1,9 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- 全部文件访问权限（免 SAF 持久化坑） -->
-    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
-        android:minSdkVersion="30" />
+    <!-- 全部文件访问权限：Android 11+ 生效，低版本系统忽略此权限 -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <application
         android:allowBackup="true"

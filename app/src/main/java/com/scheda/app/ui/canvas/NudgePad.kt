@@ -31,6 +31,7 @@ import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.lens
+import com.scheda.app.ui.components.glassHighlight
 import com.kyant.backdrop.effects.vibrancy
 import kotlinx.coroutines.delay
 
@@ -106,6 +107,7 @@ private fun NudgeKey(
                 blur(2f.dp.toPx())
                 lens(12f.dp.toPx(), 24f.dp.toPx())
             },
+            highlight = { glassHighlight() },
             onDrawSurface = {
                 drawRect(Color(0x0AFFFFFF))
             }

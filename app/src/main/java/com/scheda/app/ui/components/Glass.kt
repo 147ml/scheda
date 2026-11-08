@@ -22,6 +22,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
@@ -34,6 +35,8 @@ import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.lens
 import com.kyant.backdrop.effects.vibrancy
+import com.kyant.backdrop.highlight.Highlight
+import com.kyant.backdrop.highlight.HighlightStyle
 
 /**
  * 统一液态玻璃口径（与 Nota / Scheda 浮动状态栏实参一致）：
@@ -42,6 +45,24 @@ import com.kyant.backdrop.effects.vibrancy
  */
 val GlassTint = Color(0x0AFFFFFF)
 val GlassFallback = Color(0xFF2A2A2A)
+
+/**
+ * 边缘光统一口径（2026-11-08，与快记 / Nota / 文件盒子 / MarkPeek 同一套）：
+ * 白色 + Plus 相加，0.15dp 芯 / 0.8dp 模糊 / alpha 1.0 / 光角 40° / falloff 1.5。
+ *
+ * Plus 是相加混合，只在下层有明暗内容处显形；纯白底上看不见，不是参数错。
+ */
+fun glassHighlight(): Highlight = Highlight(
+    width = 0.15f.dp,
+    blurRadius = 0.8f.dp,
+    alpha = 1.0f,
+    style = HighlightStyle.Default(
+        color = Color.White,
+        blendMode = BlendMode.Plus,
+        angle = 40f,
+        falloff = 1.5f
+    )
+)
 
 /** 底部玻璃工具栏（含系统导航条）的占位高度：浮层元素要让它避让。 */
 @Composable
@@ -71,6 +92,7 @@ fun Modifier.glassSurface(
             blur(2.dp.toPx())
             lens(12.dp.toPx(), 24.dp.toPx())
         },
+        highlight = { glassHighlight() },
         onDrawSurface = { if (tintBrush != null) drawRect(tintBrush) else drawRect(tint) },
         layerBlock = layerBlock,
     )

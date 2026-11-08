@@ -16,6 +16,10 @@ import androidx.compose.ui.window.PopupProperties
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.geometry.Rect
+import com.kyant.backdrop.drawBackdrop
+import com.kyant.backdrop.effects.blur
+import com.kyant.backdrop.effects.lens
+import com.kyant.backdrop.effects.vibrancy
 import androidx.compose.ui.graphics.graphicsLayer
 import kotlin.math.roundToInt
 import androidx.compose.foundation.Canvas
@@ -148,7 +152,7 @@ fun BottomToolbar(
                 val ctLineType = viewModel.currentLineStyle.type
                 val ctLabel = when (ctLineType) { LineType.DASHED -> "虚线"; LineType.LIGHTNING -> "闪电"; else -> "实线" }
                 Box {
-                    DarkPill(onClick = { ltExpanded = true }, modifier = Modifier.width(56.dp), glass = glass) {
+                    DarkPill(onClick = { ltExpanded = true }, modifier = Modifier.width(56.dp), glass = glass, backdrop = backdrop) {
                         Text(ctLabel, fontSize = 11.sp, maxLines = 1, color = fg(Color.White), fontWeight = FontWeight.Bold)
                         Spacer(Modifier.width(2.dp))
                         Text("▲", fontSize = 6.sp, color = fg(Color(0xFFAAAAAA)))
@@ -270,7 +274,7 @@ fun BottomToolbar(
                         else -> "文字"
                     }
                     DarkPill(onClick = { textNumExpanded = true },
-                        modifier = Modifier.fillMaxWidth(), glass = glass, selected = isTextNum) {
+                        modifier = Modifier.fillMaxWidth(), glass = glass, selected = isTextNum, backdrop = backdrop) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(label, fontSize = 11.sp, maxLines = 1,
                                 color = if (isTextNum) fg(Color.White) else fg(Color(0xFFAAAAAA)))
@@ -309,7 +313,7 @@ fun BottomToolbar(
                     ToolType.ERASER to "橡皮"
                 )
                 otherTools.forEach { (tool, label) ->
-                    ToolBtn(viewModel, tool, label, onShowNumberDialog, onShowTextDialog, glass = glass)
+                    ToolBtn(viewModel, tool, label, onShowNumberDialog, onShowTextDialog, glass = glass, backdrop = backdrop)
                 }
             }
         }
@@ -393,6 +397,7 @@ private fun DarkPill(
     modifier: Modifier = Modifier,
     glass: Boolean = false,
     selected: Boolean = false,
+    backdrop: com.kyant.backdrop.Backdrop? = null,
     content: @Composable () -> Unit
 ) {
     val shape = RoundedCornerShape(16.dp)
@@ -410,9 +415,34 @@ private fun DarkPill(
         Box(
             Modifier
                 .matchParentSize()
-                .clip(shape)
-                .background(brush)
-                .border(1.dp, if (glass) Color(0x80FFFFFF) else Color.Transparent, shape)
+                .then(
+                    if (glass && backdrop != null) {
+                        // 真玻璃：膜色渐变照旧，边缘光由库 Highlight 提供（与全 App 统一口径）
+                        Modifier.drawBackdrop(
+                            backdrop = backdrop,
+                            shape = { shape },
+                            effects = {
+                                vibrancy()
+                                blur(2.dp.toPx())
+                                lens(12.dp.toPx(), 24.dp.toPx())
+                            },
+                            highlight = { glassHighlight() },
+                            onDrawSurface = { drawRect(brush) }
+                        )
+                    } else {
+                        // 无捕获源（非玻璃模式 / 降级）：静态膜 + 渐变描边模拟受光
+                        Modifier
+                            .clip(shape)
+                            .background(brush)
+                            .border(
+                                width = 0.8.dp,
+                                brush = if (glass) androidx.compose.ui.graphics.Brush.verticalGradient(
+                                    listOf(Color.White, Color.White.copy(alpha = 0.35f))
+                                ) else androidx.compose.ui.graphics.SolidColor(Color.Transparent),
+                                shape = shape
+                            )
+                    }
+                )
         )
         TextButton(
             onClick = onClick,
@@ -499,6 +529,7 @@ private fun RowScope.ToolBtn(
     onShowNumberDialog: () -> Unit,
     onShowTextDialog: () -> Unit = {},
     glass: Boolean = false,
+    backdrop: com.kyant.backdrop.Backdrop? = null,
 ) {
     val selected = viewModel.currentTool == tool
     DarkPill(onClick = {
@@ -508,7 +539,7 @@ private fun RowScope.ToolBtn(
             ToolType.TEXT -> onShowTextDialog()
             else -> {}
         }
-    }, modifier = Modifier.weight(1f), glass = glass, selected = selected) {
+    }, modifier = Modifier.weight(1f), glass = glass, selected = selected, backdrop = backdrop) {
         Text(label, fontSize = 11.sp,
             color = if (!glass) (if (selected) Color.White else Color(0xFFAAAAAA))
                     else (if (selected) Color.White else Color(0xFF2A2A2A)),
